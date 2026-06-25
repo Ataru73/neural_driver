@@ -1,0 +1,468 @@
+import numpy as np
+import pygame
+import gymnasium as gym
+from gymnasium import spaces
+import math
+
+def get_catmull_rom_point(p0, p1, p2, p3, t):
+    """
+    Calculates a point on a Catmull-Rom spline.
+    """
+    return 0.5 * (
+        (2 * p1) +
+        (-p0 + p2) * t +
+        (2 * p0 - 5 * p1 + 4 * p2 - p3) * t**2 +
+        (-p0 + 3 * p1 - 3 * p2 + p3) * t**3
+    )
+
+def generate_track_points(control_points, points_per_segment=25):
+    """
+    Generates a dense set of points along the track from control points.
+    """
+    track_points = []
+    num_cps = len(control_points)
+    for i in range(num_cps):
+        p0 = control_points[(i - 1) % num_cps]
+        p1 = control_points[i]
+        p2 = control_points[(i + 1) % num_cps]
+        p3 = control_points[(i + 2) % num_cps]
+        
+        for t in np.linspace(0, 1, points_per_segment, endpoint=False):
+            pt = get_catmull_rom_point(p0, p1, p2, p3, t)
+            track_points.append(pt)
+            
+    return np.array(track_points)
+
+def compute_boundaries(centerline, width=90.0):
+    """
+    Computes inner and outer boundary coordinates for the track.
+    """
+    num_pts = len(centerline)
+    outer = []
+    inner = []
+    for i in range(num_pts):
+        pt = centerline[i]
+        next_pt = centerline[(i + 1) % num_pts]
+        
+        # Tangent vector
+        tangent = next_pt - pt
+        length = np.linalg.norm(tangent)
+        if length > 0:
+            tangent /= length
+        else:
+            tangent = np.array([1.0, 0.0])
+            
+        # Normal vector (rotate 90 degrees counter-clockwise)
+        normal = np.array([-tangent[1], tangent[0]])
+        
+        outer.append(pt + (width / 2.0) * normal)
+        inner.append(pt - (width / 2.0) * normal)
+        
+    return np.array(outer), np.array(inner)
+
+class CarRacingEnv(gym.Env):
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
+    
+    def __init__(self, render_mode=None):
+        super().__init__()
+        
+        # Track definition
+        # Window size is 1200 x 900
+        self.width = 1200
+        self.height = 900
+        
+        control_points = np.array([
+            [150, 450],
+            [200, 250],
+            [450, 150],
+            [750, 200],
+            [950, 350],
+            [1050, 550],
+            [900, 750],
+            [650, 700],
+            [450, 550],
+            [250, 650]
+        ])
+
+        
+        self.track_width = 90.0
+        self.centerline = generate_track_points(control_points, points_per_segment=20)
+        self.num_checkpoints = len(self.centerline)
+        self.outer_boundary, self.inner_boundary = compute_boundaries(self.centerline, self.track_width)
+        
+        # Precompute segment boundaries for raycasting
+        # Combine inner and outer boundaries into segment format: Q (start point) and S (direction vector)
+        outer_start = self.outer_boundary
+        outer_end = np.roll(self.outer_boundary, -1, axis=0)
+        inner_start = self.inner_boundary
+        inner_end = np.roll(self.inner_boundary, -1, axis=0)
+        
+        self.Q = np.concatenate([outer_start, inner_start], axis=0)
+        self.S = np.concatenate([outer_end - outer_start, inner_end - inner_start], axis=0)
+        
+        # Car Physics Parameters
+        self.max_speed = 8.0
+        self.max_steer = math.radians(30.0) # 30 degrees
+        self.drag = 0.05
+        self.car_radius = 12.0 # for collision detection
+        
+        # Raycast parameters
+        self.ray_angles = np.array([-90, -45, -20, 0, 20, 45, 90]) # in degrees
+        self.num_rays = len(self.ray_angles)
+        self.max_ray_len = 250.0
+        
+        # Define Action Space: Discrete with 9 combinations
+        # Actions: [steering, acceleration]
+        # steering: -1 (left), 0 (straight), 1 (right)
+        # acceleration: -1 (brake/reverse), 0 (coast), 1 (gas)
+        self.action_map = {
+            0: (-1.0,  1.0), # Turn Left + Gas
+            1: ( 0.0,  1.0), # Straight + Gas
+            2: ( 1.0,  1.0), # Turn Right + Gas
+            3: (-1.0,  0.0), # Turn Left + Coast
+            4: ( 0.0,  0.0), # Straight + Coast
+            5: ( 1.0,  0.0), # Turn Right + Coast
+            6: (-1.0, -0.5), # Turn Left + Brake
+            7: ( 0.0, -0.5), # Straight + Brake
+            8: ( 1.0, -0.5), # Turn Right + Brake
+        }
+        self.action_space = spaces.Discrete(9)
+        
+        # Observation Space:
+        # [ray_0, ray_1, ..., ray_6, speed]
+        # All values normalized to [0, 1]
+        self.observation_space = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(self.num_rays + 1,),
+            dtype=np.float32
+        )
+        
+        # Rendering
+        self.render_mode = render_mode
+        self.screen = None
+        self.clock = None
+        
+        # Reset state variables
+        self.car_pos = np.zeros(2)
+        self.car_angle = 0.0
+        self.car_speed = 0.0
+        
+        self.current_checkpoint = 0
+        self.next_checkpoint = 1
+        self.steps_since_progress = 0
+        self.total_steps = 0
+        self.lap_count = 0
+        
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        
+        # Start at checkpoint 0
+        self.car_pos = np.array(self.centerline[0], dtype=np.float32)
+        
+        # Align heading with the direction to the next checkpoint
+        tangent = self.centerline[1] - self.centerline[0]
+        self.car_angle = math.atan2(tangent[1], tangent[0])
+        self.car_speed = 0.0
+        
+        self.current_checkpoint = 0
+        self.next_checkpoint = 1
+        self.steps_since_progress = 0
+        self.total_steps = 0
+        self.lap_count = 0
+        
+        observation = self._get_obs()
+        info = {}
+        
+        if self.render_mode == "human":
+            self._render_frame()
+            
+        return observation, info
+        
+    def step(self, action):
+        self.total_steps += 1
+        self.steps_since_progress += 1
+        
+        # Decode action
+        steer_input, accel_input = self.action_map[action]
+        
+        # Physics Update (Kinematic Bicycle model approximation)
+        # Update speed
+        if accel_input > 0:
+            self.car_speed += accel_input * 0.25 # Acceleration rate
+        elif accel_input < 0:
+            self.car_speed += accel_input * 0.4 # Braking rate (stronger deceleration)
+            
+        # Apply passive drag
+        self.car_speed -= self.drag * self.car_speed
+        self.car_speed = np.clip(self.car_speed, 0.0, self.max_speed)
+        
+        # Update angle (steering turn rate is proportional to speed)
+        steering_angle = steer_input * self.max_steer
+        # Turn rate decreases at higher speed to simulate steering weight, and is 0 when static
+        if self.car_speed > 0.1:
+            turn_rate = (self.car_speed / self.max_speed) * steering_angle * 0.15
+            self.car_angle += turn_rate
+            
+        # Keep angle normalized between -pi and pi
+        self.car_angle = math.atan2(math.sin(self.car_angle), math.cos(self.car_angle))
+        
+        # Update position
+        self.car_pos[0] += self.car_speed * math.cos(self.car_angle)
+        self.car_pos[1] += self.car_speed * math.sin(self.car_angle)
+        
+        # Check closest checkpoint (local search window to avoid skipping/glitching)
+        self._update_progress()
+        
+        # Compute observations and raycasts
+        ray_distances = self._cast_all_rays()
+        
+        # Check collision conditions
+        # Collision occurs if any ray distance is less than car_radius or if we are too far from centerline
+        dist_to_centerline = np.linalg.norm(self.car_pos - self.centerline[self.current_checkpoint])
+        off_track = dist_to_centerline > (self.track_width / 2.0 - self.car_radius + 5.0)
+        near_collision = np.any(ray_distances * self.max_ray_len < self.car_radius)
+        
+        collided = off_track or near_collision
+        
+        # Reward function design
+        reward = 0.0
+        terminated = False
+        truncated = False
+        
+        # 1. Base step penalty to encourage speed and completion
+        reward -= 0.1
+        
+        # 2. Progress reward (passing checkpoints)
+        checkpoint_passed = False
+        dist_to_next_cp = np.linalg.norm(self.car_pos - self.centerline[self.next_checkpoint])
+        
+        # If car gets close to the next checkpoint, reward it and update target checkpoint
+        if dist_to_next_cp < (self.track_width * 0.8):
+            # Verify direction is forward
+            # The current checkpoint should update to the next checkpoint
+            if self.current_checkpoint == self.next_checkpoint:
+                reward += 15.0
+                self.next_checkpoint = (self.next_checkpoint + 1) % self.num_checkpoints
+                self.steps_since_progress = 0
+                checkpoint_passed = True
+                
+                # Check for lap completion
+                if self.next_checkpoint == 1:
+                    self.lap_count += 1
+                    reward += 100.0 # big lap completion reward!
+                    # End episode after 2 laps to avoid infinite loops during training
+                    if self.lap_count >= 2:
+                        terminated = True
+        
+        # 3. Heading alignment reward: reward aligning with track direction
+        # Track heading angle at current checkpoint
+        next_idx = (self.current_checkpoint + 1) % self.num_checkpoints
+        cp_tangent = self.centerline[next_idx] - self.centerline[self.current_checkpoint]
+        track_angle = math.atan2(cp_tangent[1], cp_tangent[0])
+        
+        angle_diff = math.atan2(math.sin(self.car_angle - track_angle), math.cos(self.car_angle - track_angle))
+        alignment = math.cos(angle_diff) # 1.0 if perfectly aligned, -1.0 if facing backwards
+        
+        # Speed reward (scaled by direction alignment, so going fast backward is penalized)
+        reward += (self.car_speed / self.max_speed) * alignment * 0.3
+        
+        # 4. Collision/Off-track penalty
+        if collided:
+            reward -= 100.0
+            terminated = True
+            
+        # 5. Stagnation check: terminate if car doesn't make progress for too long
+        if self.steps_since_progress > 200:
+            reward -= 50.0
+            truncated = True
+            
+        # Prepare observation
+        # Observation includes the raycast distances (normalized to [0,1]) and the speed (normalized to [0,1])
+        observation = np.zeros(self.num_rays + 1, dtype=np.float32)
+        observation[:self.num_rays] = ray_distances
+        observation[self.num_rays] = self.car_speed / self.max_speed
+        
+        info = {
+            "checkpoint": self.current_checkpoint,
+            "next_checkpoint": self.next_checkpoint,
+            "laps": self.lap_count,
+            "speed": self.car_speed,
+            "collided": collided,
+            "progress_steps": self.steps_since_progress
+        }
+        
+        if self.render_mode == "human":
+            self._render_frame()
+            
+        return observation, reward, terminated, truncated, info
+        
+    def _get_obs(self):
+        ray_distances = self._cast_all_rays()
+        obs = np.zeros(self.num_rays + 1, dtype=np.float32)
+        obs[:self.num_rays] = ray_distances
+        obs[self.num_rays] = self.car_speed / self.max_speed
+        return obs
+        
+    def _update_progress(self):
+        # Local search around current checkpoint
+        num_pts = self.num_checkpoints
+        min_dist = float('inf')
+        best_idx = self.current_checkpoint
+        
+        # Look 15 checkpoints ahead and 5 checkpoints behind
+        for offset in range(-5, 15):
+            idx = (self.current_checkpoint + offset) % num_pts
+            dist = np.linalg.norm(self.car_pos - self.centerline[idx])
+            if dist < min_dist:
+                min_dist = dist
+                best_idx = idx
+                
+        self.current_checkpoint = best_idx
+        
+    def _cast_all_rays(self):
+        ray_distances = []
+        for angle_deg in self.ray_angles:
+            # Ray angle in world coordinates
+            theta = self.car_angle + math.radians(angle_deg)
+            r = np.array([math.cos(theta), math.sin(theta)]) * self.max_ray_len
+            
+            # Intersection using vectorized logic
+            dist = self._cast_ray(self.car_pos, r)
+            ray_distances.append(dist)
+            
+        return np.array(ray_distances, dtype=np.float32)
+        
+    def _cast_ray(self, p, r):
+        # Vectorized intersection of ray (p, r) with boundaries Q, S
+        # Q: start of segments (2N, 2)
+        # S: segment vectors (2N, 2)
+        denom = r[0] * self.S[:, 1] - r[1] * self.S[:, 0]
+        
+        # Avoid division by zero
+        mask = np.abs(denom) > 1e-6
+        if not np.any(mask):
+            return 1.0
+            
+        q_p_x = self.Q[mask, 0] - p[0]
+        q_p_y = self.Q[mask, 1] - p[1]
+        
+        t_val = (q_p_x * self.S[mask, 1] - q_p_y * self.S[mask, 0]) / denom[mask]
+        u_val = (q_p_x * r[1] - q_p_y * r[0]) / denom[mask]
+        
+        valid = (t_val >= 0.0) & (t_val <= 1.0) & (u_val >= 0.0) & (u_val <= 1.0)
+        
+        valid_t = t_val[valid]
+        if len(valid_t) > 0:
+            return float(np.min(valid_t))
+        return 1.0
+        
+    def render(self):
+        if self.render_mode == "rgb_array":
+            return self._render_frame()
+            
+    def _render_frame(self):
+        if self.screen is None:
+            pygame.init()
+            if self.render_mode == "human":
+                pygame.display.init()
+                self.screen = pygame.display.set_mode((self.width, self.height))
+                pygame.display.set_caption("Neural Network Driving Agent")
+            else:
+                self.screen = pygame.Surface((self.width, self.height))
+                
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
+            
+        # Draw background (field)
+        self.screen.fill((34, 139, 34)) # Forest Green
+        
+        # Draw track boundaries
+        # Fill track road with dark grey
+        pygame.draw.polygon(self.screen, (60, 60, 60), self.outer_boundary)
+        pygame.draw.polygon(self.screen, (34, 139, 34), self.inner_boundary) # Grass hole in the middle
+        
+        # Draw inner and outer borders lines (white / red stripes)
+        pygame.draw.polygon(self.screen, (220, 220, 220), self.outer_boundary, 3)
+        pygame.draw.polygon(self.screen, (220, 220, 220), self.inner_boundary, 3)
+        
+        # Draw centerline checkpoints (for debugging/visual reference)
+        for i, cp in enumerate(self.centerline):
+            # Highlight current and next checkpoints
+            if i == self.current_checkpoint:
+                pygame.draw.circle(self.screen, (0, 0, 255), cp.astype(int), 4)
+            elif i == self.next_checkpoint:
+                pygame.draw.circle(self.screen, (255, 165, 0), cp.astype(int), 6)
+            else:
+                pygame.draw.circle(self.screen, (100, 100, 100), cp.astype(int), 2)
+                
+        # Draw Raycasts
+        ray_distances = self._cast_all_rays()
+        for angle_deg, dist in zip(self.ray_angles, ray_distances):
+            theta = self.car_angle + math.radians(angle_deg)
+            actual_len = dist * self.max_ray_len
+            end_x = self.car_pos[0] + actual_len * math.cos(theta)
+            end_y = self.car_pos[1] + actual_len * math.sin(theta)
+            
+            # Color shifts from green to red based on proximity to wall
+            color = (int(255 * (1 - dist)), int(255 * dist), 0)
+            pygame.draw.line(self.screen, color, self.car_pos.astype(int), (int(end_x), int(end_y)), 1)
+            pygame.draw.circle(self.screen, color, (int(end_x), int(end_y)), 3)
+            
+        # Draw Car
+        # Create a surface for the car to allow rotation
+        car_w, car_l = int(self.car_radius * 1.2), int(self.car_radius * 2.2)
+        car_surf = pygame.Surface((car_l, car_w), pygame.SRCALPHA)
+        
+        # Body (Yellow race car)
+        pygame.draw.rect(car_surf, (255, 215, 0), (0, 0, car_l, car_w), border_radius=4)
+        # Windshield
+        pygame.draw.rect(car_surf, (30, 30, 30), (int(car_l * 0.5), int(car_w * 0.15), int(car_l * 0.25), int(car_w * 0.7)))
+        # Wheels
+        pygame.draw.rect(car_surf, (10, 10, 10), (int(car_l * 0.15), -2, int(car_l * 0.2), 2))
+        pygame.draw.rect(car_surf, (10, 10, 10), (int(car_l * 0.15), car_w, int(car_l * 0.2), 2))
+        pygame.draw.rect(car_surf, (10, 10, 10), (int(car_l * 0.65), -2, int(car_l * 0.2), 2))
+        pygame.draw.rect(car_surf, (10, 10, 10), (int(car_l * 0.65), car_w, int(car_l * 0.2), 2))
+        # Spoiler
+        pygame.draw.rect(car_surf, (150, 0, 0), (-2, int(car_w * 0.1), 4, int(car_w * 0.8)))
+        
+        # Rotate car image. Pygame rotates counter-clockwise.
+        rot_angle_deg = -math.degrees(self.car_angle)
+        rot_car = pygame.transform.rotate(car_surf, rot_angle_deg)
+        
+        # Position car
+        car_rect = rot_car.get_rect(center=self.car_pos.astype(int))
+        self.screen.blit(rot_car, car_rect.topleft)
+        
+        # Draw HUD info
+        font = pygame.font.SysFont("Arial", 20)
+        speed_text = font.render(f"Speed: {self.car_speed * 10:.1f} km/h", True, (255, 255, 255))
+        checkpoint_text = font.render(f"Checkpoint: {self.current_checkpoint}/{self.num_checkpoints}", True, (255, 255, 255))
+        laps_text = font.render(f"Laps: {self.lap_count}", True, (255, 255, 255))
+        steps_text = font.render(f"Steps: {self.total_steps}", True, (255, 255, 255))
+        
+        hud_bg = pygame.Surface((250, 120))
+        hud_bg.fill((0, 0, 0))
+        hud_bg.set_alpha(150)
+        self.screen.blit(hud_bg, (10, 10))
+        
+        self.screen.blit(speed_text, (20, 20))
+        self.screen.blit(checkpoint_text, (20, 45))
+        self.screen.blit(laps_text, (20, 70))
+        self.screen.blit(steps_text, (20, 95))
+        
+        if self.render_mode == "human":
+            pygame.event.pump()
+            pygame.display.flip()
+            self.clock.tick(self.metadata["render_fps"])
+        else:
+            return np.transpose(
+                np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2)
+            )
+            
+    def close(self):
+        if self.screen is not None:
+            pygame.display.quit()
+            pygame.quit()
+            self.screen = None
+            self.clock = None

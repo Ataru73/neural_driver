@@ -1,0 +1,345 @@
+import numpy as np
+import pygame
+import math
+import gymnasium as gym
+from gymnasium import spaces
+from environment import generate_track_points, compute_boundaries
+
+class GeneticCarRacingEnv:
+    metadata = {"render_modes": ["human"], "render_fps": 60}
+    
+    def __init__(self, pop_size=30, render_mode=None):
+        self.pop_size = pop_size
+        self.render_mode = render_mode
+        
+        # Window / Screen parameters
+        self.width = 1200
+        self.height = 900
+        
+        # Track definition (same as DQN)
+        control_points = np.array([
+            [150, 450],
+            [200, 250],
+            [450, 150],
+            [750, 200],
+            [950, 350],
+            [1050, 550],
+            [900, 750],
+            [650, 700],
+            [450, 550],
+            [250, 650]
+        ])
+
+        
+        self.track_width = 90.0
+        self.centerline = generate_track_points(control_points, points_per_segment=20)
+        self.num_checkpoints = len(self.centerline)
+        self.outer_boundary, self.inner_boundary = compute_boundaries(self.centerline, self.track_width)
+        
+        # Precompute segment boundaries for raycasting
+        outer_start = self.outer_boundary
+        outer_end = np.roll(self.outer_boundary, -1, axis=0)
+        inner_start = self.inner_boundary
+        inner_end = np.roll(self.inner_boundary, -1, axis=0)
+        self.Q = np.concatenate([outer_start, inner_start], axis=0)
+        self.S = np.concatenate([outer_end - outer_start, inner_end - inner_start], axis=0)
+        
+        # Car Physics Parameters
+        self.max_speed = 8.0
+        self.max_steer = math.radians(30.0)
+        self.drag = 0.05
+        self.car_radius = 12.0
+        
+        # Raycast parameters
+        self.ray_angles = np.array([-90, -45, -20, 0, 20, 45, 90])
+        self.num_rays = len(self.ray_angles)
+        self.max_ray_len = 250.0
+        
+        self.action_map = {
+            0: (-1.0,  1.0), # Turn Left + Gas
+            1: ( 0.0,  1.0), # Straight + Gas
+            2: ( 1.0,  1.0), # Turn Right + Gas
+            3: (-1.0,  0.0), # Turn Left + Coast
+            4: ( 0.0,  0.0), # Straight + Coast
+            5: ( 1.0,  0.0), # Turn Right + Coast
+            6: (-1.0, -0.5), # Turn Left + Brake
+            7: ( 0.0, -0.5), # Straight + Brake
+            8: ( 1.0, -0.5), # Turn Right + Brake
+        }
+        
+        # State arrays for population
+        self.car_pos = np.zeros((self.pop_size, 2), dtype=np.float32)
+        self.car_angle = np.zeros(self.pop_size, dtype=np.float32)
+        self.car_speed = np.zeros(self.pop_size, dtype=np.float32)
+        self.active = np.zeros(self.pop_size, dtype=bool)
+        
+        self.current_checkpoint = np.zeros(self.pop_size, dtype=int)
+        self.next_checkpoint = np.zeros(self.pop_size, dtype=int)
+        self.steps_since_progress = np.zeros(self.pop_size, dtype=int)
+        self.total_steps = np.zeros(self.pop_size, dtype=int)
+        self.lap_count = np.zeros(self.pop_size, dtype=int)
+        self.fitness = np.zeros(self.pop_size, dtype=np.float32)
+        
+        # Rendering
+        self.screen = None
+        self.clock = None
+        self.generation = 1
+        
+    def reset(self, generation=None):
+        if generation is not None:
+            self.generation = generation
+            
+        tangent = self.centerline[1] - self.centerline[0]
+        start_angle = math.atan2(tangent[1], tangent[0])
+        
+        for i in range(self.pop_size):
+            self.car_pos[i] = np.array(self.centerline[0], dtype=np.float32)
+            self.car_angle[i] = start_angle
+            self.car_speed[i] = 0.0
+            self.active[i] = True
+            
+            self.current_checkpoint[i] = 0
+            self.next_checkpoint[i] = 1
+            self.steps_since_progress[i] = 0
+            self.total_steps[i] = 0
+            self.lap_count[i] = 0
+            self.fitness[i] = 0.0
+            
+        return self._get_observations()
+        
+    def step(self, actions):
+        """
+        Step all cars in the population.
+        actions: list or array of action indices of length pop_size
+        """
+        for i in range(self.pop_size):
+            if not self.active[i]:
+                continue
+                
+            self.total_steps[i] += 1
+            self.steps_since_progress[i] += 1
+            
+            action = actions[i]
+            steer_input, accel_input = self.action_map[action]
+            
+            # Physics Update
+            if accel_input > 0:
+                self.car_speed[i] += accel_input * 0.25
+            elif accel_input < 0:
+                self.car_speed[i] += accel_input * 0.4
+                
+            self.car_speed[i] -= self.drag * self.car_speed[i]
+            self.car_speed[i] = np.clip(self.car_speed[i], 0.0, self.max_speed)
+            
+            steering_angle = steer_input * self.max_steer
+            if self.car_speed[i] > 0.1:
+                turn_rate = (self.car_speed[i] / self.max_speed) * steering_angle * 0.15
+                self.car_angle[i] += turn_rate
+                
+            self.car_angle[i] = math.atan2(math.sin(self.car_angle[i]), math.cos(self.car_angle[i]))
+            
+            self.car_pos[i, 0] += self.car_speed[i] * math.cos(self.car_angle[i])
+            self.car_pos[i, 1] += self.car_speed[i] * math.sin(self.car_angle[i])
+            
+            # Update Progress (Checkpoint tracking)
+            self._update_car_progress(i)
+            
+            # Cast rays to compute collision and distances
+            ray_distances = self._cast_car_rays(i)
+            
+            # Check collisions
+            dist_to_centerline = np.linalg.norm(self.car_pos[i] - self.centerline[self.current_checkpoint[i]])
+            off_track = dist_to_centerline > (self.track_width / 2.0 - self.car_radius + 5.0)
+            near_collision = np.any(ray_distances * self.max_ray_len < self.car_radius)
+            
+            collided = off_track or near_collision
+            
+            # Update Fitness
+            # Base survival reward
+            self.fitness[i] += 0.1
+            
+            # Check for checkpoint completion
+            dist_to_next_cp = np.linalg.norm(self.car_pos[i] - self.centerline[self.next_checkpoint[i]])
+            if dist_to_next_cp < (self.track_width * 0.8) and self.current_checkpoint[i] == self.next_checkpoint[i]:
+                # Fitness gain for checkpoint
+                self.fitness[i] += 150.0
+                self.next_checkpoint[i] = (self.next_checkpoint[i] + 1) % self.num_checkpoints
+                self.steps_since_progress[i] = 0
+                
+                if self.next_checkpoint[i] == 1:
+                    self.lap_count[i] += 1
+                    # Sorter time (fewer steps) = higher fitness.
+                    # Base reward is 50000.0, and we subtract 5.0 per step taken.
+                    self.fitness[i] = 50000.0 - (self.total_steps[i] * 5.0)
+                    self.active[i] = False
+                    continue # Skip other deactivation checks since it completed successfully
+                    
+            # Check deactivation conditions
+            if collided:
+                self.active[i] = False
+                # Penalize crashing slightly
+                self.fitness[i] = max(0.0, self.fitness[i] - 100.0)
+            elif self.steps_since_progress[i] > 120:
+                # Stagnant car
+                self.active[i] = False
+                self.fitness[i] = max(0.0, self.fitness[i] - 50.0)
+
+                
+        # If human rendering mode is set, display it
+        if self.render_mode == "human":
+            self._render_frame()
+            
+        observations = self._get_observations()
+        done = not np.any(self.active)
+        
+        return observations, self.fitness, done, {}
+        
+    def _update_car_progress(self, i):
+        num_pts = self.num_checkpoints
+        min_dist = float('inf')
+        best_idx = self.current_checkpoint[i]
+        
+        for offset in range(-5, 15):
+            idx = (self.current_checkpoint[i] + offset) % num_pts
+            dist = np.linalg.norm(self.car_pos[i] - self.centerline[idx])
+            if dist < min_dist:
+                min_dist = dist
+                best_idx = idx
+                
+        self.current_checkpoint[i] = best_idx
+        
+    def _cast_car_rays(self, i):
+        ray_distances = []
+        for angle_deg in self.ray_angles:
+            theta = self.car_angle[i] + math.radians(angle_deg)
+            r = np.array([math.cos(theta), math.sin(theta)]) * self.max_ray_len
+            
+            denom = r[0] * self.S[:, 1] - r[1] * self.S[:, 0]
+            mask = np.abs(denom) > 1e-6
+            
+            if not np.any(mask):
+                ray_distances.append(1.0)
+                continue
+                
+            q_p_x = self.Q[mask, 0] - self.car_pos[i, 0]
+            q_p_y = self.Q[mask, 1] - self.car_pos[i, 1]
+            
+            t_val = (q_p_x * self.S[mask, 1] - q_p_y * self.S[mask, 0]) / denom[mask]
+            u_val = (q_p_x * r[1] - q_p_y * r[0]) / denom[mask]
+            
+            valid = (t_val >= 0.0) & (t_val <= 1.0) & (u_val >= 0.0) & (u_val <= 1.0)
+            
+            valid_t = t_val[valid]
+            if len(valid_t) > 0:
+                ray_distances.append(float(np.min(valid_t)))
+            else:
+                ray_distances.append(1.0)
+                
+        return np.array(ray_distances, dtype=np.float32)
+        
+    def _get_observations(self):
+        obs = np.zeros((self.pop_size, self.num_rays + 1), dtype=np.float32)
+        for i in range(self.pop_size):
+            if not self.active[i]:
+                continue
+            ray_distances = self._cast_car_rays(i)
+            obs[i, :self.num_rays] = ray_distances
+            obs[i, self.num_rays] = self.car_speed[i] / self.max_speed
+        return obs
+        
+    def _render_frame(self):
+        if self.screen is None:
+            pygame.init()
+            pygame.display.init()
+            self.screen = pygame.display.set_mode((self.width, self.height))
+            pygame.display.set_caption("Neuroevolution / Algoritmo Genetico - Auto da Corsa")
+            
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
+            
+        # Draw background
+        self.screen.fill((34, 139, 34))
+        
+        # Draw track boundaries
+        pygame.draw.polygon(self.screen, (60, 60, 60), self.outer_boundary)
+        pygame.draw.polygon(self.screen, (34, 139, 34), self.inner_boundary)
+        pygame.draw.polygon(self.screen, (220, 220, 220), self.outer_boundary, 3)
+        pygame.draw.polygon(self.screen, (220, 220, 220), self.inner_boundary, 3)
+        
+        # Find leading active car (greatest checkpoint or highest fitness)
+        leader_idx = -1
+        max_fit = -1.0
+        for i in range(self.pop_size):
+            if self.active[i] and self.fitness[i] > max_fit:
+                max_fit = self.fitness[i]
+                leader_idx = i
+                
+        # Draw all cars (faded red for dead, bright yellow for active, blue/cyan for leader)
+        for i in range(self.pop_size):
+            pos = self.car_pos[i].astype(int)
+            angle = self.car_angle[i]
+            
+            # Skip drawing cars that died long ago at the starting line to avoid clutter
+            if not self.active[i] and self.fitness[i] < 50.0:
+                continue
+                
+            car_w, car_l = int(self.car_radius * 1.2), int(self.car_radius * 2.2)
+            car_surf = pygame.Surface((car_l, car_w), pygame.SRCALPHA)
+            
+            # Determine color
+            if i == leader_idx:
+                color = (0, 191, 255) # Deep Sky Blue for leader
+            elif self.active[i]:
+                color = (255, 215, 0) # Gold for normal active cars
+            else:
+                color = (180, 50, 50, 100) # Semi-transparent Red for crashed cars
+                
+            pygame.draw.rect(car_surf, color, (0, 0, car_l, car_w), border_radius=4)
+            # Windshield
+            pygame.draw.rect(car_surf, (30, 30, 30), (int(car_l * 0.5), int(car_w * 0.15), int(car_l * 0.25), int(car_w * 0.7)))
+            
+            rot_angle_deg = -math.degrees(angle)
+            rot_car = pygame.transform.rotate(car_surf, rot_angle_deg)
+            car_rect = rot_car.get_rect(center=pos)
+            self.screen.blit(rot_car, car_rect.topleft)
+            
+        # Draw Raycasts ONLY for the leader (to keep screen clean)
+        if leader_idx != -1:
+            ray_distances = self._cast_car_rays(leader_idx)
+            for angle_deg, dist in zip(self.ray_angles, ray_distances):
+                theta = self.car_angle[leader_idx] + math.radians(angle_deg)
+                actual_len = dist * self.max_ray_len
+                end_x = self.car_pos[leader_idx, 0] + actual_len * math.cos(theta)
+                end_y = self.car_pos[leader_idx, 1] + actual_len * math.sin(theta)
+                color = (int(255 * (1 - dist)), int(255 * dist), 0)
+                pygame.draw.line(self.screen, color, self.car_pos[leader_idx].astype(int), (int(end_x), int(end_y)), 1)
+                pygame.draw.circle(self.screen, color, (int(end_x), int(end_y)), 3)
+                
+        # Draw HUD info
+        active_count = np.sum(self.active)
+        best_fitness = np.max(self.fitness) if len(self.fitness) > 0 else 0.0
+        
+        font = pygame.font.SysFont("Arial", 20)
+        gen_text = font.render(f"Generation: {self.generation}", True, (255, 255, 255))
+        active_text = font.render(f"Active Cars: {active_count}/{self.pop_size}", True, (255, 255, 255))
+        fit_text = font.render(f"Best Fitness: {best_fitness:.1f}", True, (255, 255, 255))
+        
+        hud_bg = pygame.Surface((250, 100))
+        hud_bg.fill((0, 0, 0))
+        hud_bg.set_alpha(150)
+        self.screen.blit(hud_bg, (10, 10))
+        
+        self.screen.blit(gen_text, (20, 20))
+        self.screen.blit(active_text, (20, 45))
+        self.screen.blit(fit_text, (20, 70))
+        
+        pygame.event.pump()
+        pygame.display.flip()
+        self.clock.tick(self.metadata["render_fps"])
+        
+    def close(self):
+        if self.screen is not None:
+            pygame.display.quit()
+            pygame.quit()
+            self.screen = None
+            self.clock = None
