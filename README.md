@@ -1,117 +1,119 @@
-# Simulatore di Guida Autonoma 2D con PyTorch (DQN)
+# 2D Autonomous Driving Simulator with PyTorch
 
-Questo progetto implementa una simulazione 2D in Python in cui una macchinina deve imparare a percorrere un circuito nel minor tempo possibile senza uscire di strada. L'agente viene addestrato tramite Reinforcement Learning (in particolare, l'algoritmo **Deep Q-Network - DQN**) usando **PyTorch**, **Gymnasium** e **Pygame**.
+This project implements a 2D car racing simulator in Python where an agent learns to navigate a custom racetrack in the shortest time possible without going off-track. The project features two distinct training pathways: **Deep Q-Learning (DQN)** and a **Genetic Algorithm (Neuroevolution)**, built using **PyTorch**, **Gymnasium**, and **Pygame**.
 
-## Struttura del Progetto
-
-Il progetto contiene due filoni di addestramento: **Deep Q-Learning (DQN)** e **Algoritmo Genetico (Neuroevoluzione)**.
-
-### File Comuni e DQN:
-- **`environment.py`**: Definisce il circuito (curve spline Catmull-Rom) e l'ambiente Gymnasium (`CarRacingEnv`) per un singolo veicolo. Gestisce la fisica, il raycasting e il disegno.
-- **`model.py`**: Definisce la rete neurale PyTorch utilizzata sia da DQN che dall'Algoritmo Genetico.
-- **`agent.py`**: Gestisce l'agente DQN (scelta azioni, replay buffer, aggiornamenti e caricamento/salvataggio dei modelli).
-- **`train.py`**: Script per addestrare l'agente via DQN (in modalità headless). Salva il modello in `models/best_model.pt`.
-- **`enjoy.py`**: Visualizza la macchinina in azione con la grafica. Supporta la guida manuale o l'AI (sia DQN che Genetico).
-
-### File Algoritmo Genetico:
-- **`genetic_environment.py`**: Estende la simulazione per gestire una popolazione parallela di vetture contemporaneamente.
-- **`train_genetic.py`**: Script per addestrare i pesi della rete neurale tramite selezione naturale, crossover e mutazione di una popolazione di auto.
+The track centerline is generated dynamically using smooth **Catmull-Rom spline interpolation** from a set of control points, ensuring smooth sweeping curves and natural road layouts.
 
 ---
 
-## Installazione ed Avvio
+## Project Structure
 
-1. **Crea l'ambiente virtuale** (già fatto se usi la configurazione corrente):
+The project is divided into the following key files:
+
+### Core Files & DQN
+- **`environment.py`**: Implements the racetrack and the Gymnasium-compatible simulator (`CarRacingEnv`) for a single car. Handles vehicle physics, distance raycasting (7 laser sensors), progress/checkpoint tracking, and rendering.
+- **`model.py`**: Defines the PyTorch Neural Network architecture (3-layer Feed-Forward Network with ReLU activations) shared by both DQN and the Genetic Algorithm.
+- **`agent.py`**: Implements the DQN Agent, including action selection (epsilon-greedy), the experience replay buffer (`ReplayBuffer`), learning updates, and robust model saving/loading.
+- **`train.py`**: Headless training script for the DQN agent. Automatically saves the absolute best model to `models/best_model.pt` and exports a progress graph to `models/training_progress.png`.
+- **`enjoy.py`**: Interactive visualization tool. Loads any trained model (DQN or Genetic) and lets you watch the AI drive, or allows you to take over manually using arrow keys or WASD.
+
+### Genetic Algorithm (Neuroevolution)
+- **`genetic_environment.py`**: Extends the single-car simulator into a multi-agent environment (`GeneticCarRacingEnv`) that simulates a population of cars racing simultaneously in the same environment.
+- **`train_genetic.py`**: Implements the Genetic Algorithm training loop. Features elitism, uniform crossover, Gaussian mutations, and visual rendering during evolution.
+
+---
+
+## Installation & Setup
+
+1. **Create and activate the virtual environment**:
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
    ```
 
-2. **Installa le dipendenze**:
+2. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
 ---
 
-## Come Usare il Progetto
+## How to Run
 
-### 1. Addestrare il Modello
-Per avviare l'addestramento della rete neurale, esegui:
+### 1. Deep Q-Learning (DQN)
+
+#### Train a DQN Agent (Headless/Fast):
 ```bash
 python train.py
 ```
-*Nota: Questa modalità è "headless" (senza finestra grafica) per addestrare l'agente molto rapidamente. Durante l'esecuzione vedrai stampate le metriche sulle performance correnti ogni 10 episodi. Al termine, troverai il grafico dei progressi in `models/training_progress.png`.*
+*Note: This runs in headless mode to maximize frames per second. Training metrics (average reward, checkpoints reached, current epsilon) are printed every 10 episodes.*
 
-### Continuare l'Addestramento di un Modello Esistente
-Se desideri continuare l'addestramento partendo da un modello già salvato (es. `models/final_model.pt` o uno dei checkpoint salvati), puoi passare il percorso del file come parametro dello script. L'agente caricherà i pesi della rete, lo stato dell'ottimizzatore e il contatore degli step riprendendo l'addestramento con lo stesso livello di esplorazione ($\epsilon$) del momento del salvataggio:
+#### Resume DQN Training:
+You can resume training from a saved checkpoint or final model while preserving the exploration rate ($\epsilon$) and optimizer state:
 ```bash
 python train.py models/final_model.pt
 ```
 
 ---
 
-### Addestrare con l'Algoritmo Genetico (Neuroevoluzione)
-In alternativa al DQN, l'Algoritmo Genetico fa correre una popolazione di auto (es. 40) contemporaneamente. A ogni generazione, le auto peggiori (che sbattono o si fermano) vengono eliminate. Le auto migliori (con maggiore "fitness") vengono selezionate per riprodursi tramite crossover e mutazione dei pesi delle loro reti neurali.
+### 2. Genetic Algorithm (Neuroevolution)
 
-Questo approccio è eccezionalmente stabile per aggirare curve complesse perché la popolazione esplora molteplici traiettorie in parallelo.
+The Genetic Algorithm simulates a population of 40 cars simultaneously. At each generation, slow or crashed cars are eliminated. The top performers (highest fitness) are selected to reproduce via crossover and mutation.
 
-#### Addestramento Headless (molto veloce):
+When a car successfully completes 1 lap, its simulation is immediately stopped, and its final fitness is calculated based on its completion time:
+$$\text{Fitness} = 50000.0 - (\text{total\_steps} \times 5.0)$$
+This ensures that shorter lap times (fewer steps) result in higher fitness, forcing the population to evolve faster driving behaviors.
+
+#### Train Headless (Fast):
 ```bash
 python train_genetic.py
 ```
 
-#### Addestramento Visivo (consigliato per lo spettacolo!):
-Puoi guardare l'intera popolazione di macchine che corre e impara in tempo reale sullo schermo:
+#### Train Visually (Highly Recommended!):
+Watch the entire population learn, crash, and race in real-time on your screen:
 ```bash
 python train_genetic.py --render
 ```
-*Le auto che sbattono diventano rosse e trasparenti, mentre il leader della generazione corrente viene evidenziato in azzurro proiettando i suoi sensori laser.*
+- *Crashed or stagnant cars turn semi-transparent red, while the current generation leader is highlighted in cyan, projecting its active laser sensors.*
 
-Al termine dell'addestramento, il modello migliore viene salvato in `models/genetic_best.pt` e il grafico dei progressi in `models/genetic_progress.png`. Per preservare i checkpoint storici, il sistema salva anche file come `models/checkpoint_gen_20.pt` ogni 20 generazioni.
-
-#### Continuare il Training Genetico da un Modello Preesistente:
-Se desideri riprendere l'addestramento o affinare un modello genetico (o persino un modello addestrato in DQN!) usando la neuroevoluzione, puoi passare il percorso del file come argomento:
+#### Resume Genetic Training from a Pretrained Model:
+You can seed a new genetic population using a pretrained champion model (from either DQN or GA):
 ```bash
 python train_genetic.py models/genetic_best.pt
-# oppure con rendering attivo:
+# or with visualization:
 python train_genetic.py models/genetic_best.pt --render
 ```
-*L'algoritmo caricherà il modello e lo userà per "seminare" la prima generazione: una copia esatta del campione (per non perdere le abilità acquisite) e le restanti auto come cloni mutati del campione (con gradi di mutazione variabili per esplorare lo spazio circostante).*
-
-Per guardare il modello genetico migliore all'opera:
-```bash
-python enjoy.py models/genetic_best.pt
-```
-
+*The algorithm clones the champion exactly as the elite agent (to preserve its skills) and fills the rest of the population with mutated variations of it (using mixed mutation scales to explore nearby trajectories).*
 
 ---
 
-### 2. Guardare il Modello Addestrato o Guidare Manualmente
-Per visualizzare l'interfaccia grafica e vedere come guida il modello addestrato (oppure guidare tu stesso):
+### 3. Visualizing a Trained Model or Driving Manually
+
+To watch a trained model drive, or to drive the car yourself:
 ```bash
-python enjoy.py
+python enjoy.py models/genetic_best.pt  # or models/best_model.pt
 ```
 
-#### Controlli Tastiera:
-- **`A`**: Passa alla modalità **Guida Autonoma (AI)**.
-- **`M`**: Passa alla modalità **Guida Manuale**.
-- **`R`**: Resetta la macchinina all'inizio del circuito.
-- **Freccia Su / W**: Accelera.
-- **Freccia Giù / S**: Frena / Retromarcia.
-- **Freccia Sinistra / A**: Curva a sinistra.
-- **Freccia Destra / D**: Curva a destra.
-- **`ESC`**: Chiude il simulatore.
+#### Key Controls:
+- **`A`**: Switch to **AI Mode** (the neural network takes control).
+- **`M`**: Switch to **Manual Mode** (you drive the car).
+- **`R`**: Reset the track and place the car back at the starting line.
+- **`ESC`**: Exit the simulator.
+
+#### Driving Controls (Manual Mode):
+- **Up Arrow / W**: Accelerate.
+- **Down Arrow / S**: Brake / Reverse.
+- **Left Arrow / A**: Steer Left.
+- **Right Arrow / D**: Steer Right.
 
 ---
 
-## Dettagli Tecnici
+## Technical Details
 
-- **Sensori (Input dell'Agente)**: La macchina proietta 7 sensori di distanza (raggi) con angoli a `[-90°, -45°, -20°, 0°, 20°, 45°, 90°]` rispetto alla direzione del veicolo. Questi raggi rilevano la distanza dai bordi stradali. L'input finale dell'agente è composto da questi 7 valori normalizzati più la velocità corrente della vettura.
-- **Spazio delle Azioni (Output)**: L'agente ha a disposizione 9 azioni discrete derivate dalla combinazione di sterzo (Sinistra, Dritto, Destra) e acceleratore (Accelerazione, Coasting, Freno).
-- **Funzione di Reward**:
-  - Penalità fissa a ogni step per incoraggiare la velocità e il completamento rapido.
-  - Ricompensa per il superamento sequenziale dei checkpoint del circuito (`+15`).
-  - Ricompensa per il completamento di ogni giro (`+100`).
-  - Ricompensa per l'allineamento della direzione della macchina rispetto alla tangente del circuito.
-  - Grande penalità in caso di collisione con i bordi del circuito (`-100`).
+- **Sensor Inputs (State Space)**: 7 normalized distance measurements from laser raycasts angled at `[-90°, -45°, -20°, 0°, 20°, 45°, 90°]` relative to the car's heading, plus the car's normalized current speed (8-dimensional state vector).
+- **Action Space**: 9 discrete actions representing combinations of steering (Left, Straight, Right) and acceleration (Accelerate, Coast, Brake).
+- **DQN Reward Design**:
+  - Base time penalty (`-0.1` per step) to encourage speed.
+  - Positive reward (`+15`) for hitting sequential checkpoints in the correct order.
+  - Alignment reward based on the cosine of the heading angle error compared to the track centerline tangent.
+  - Collision penalty (`-100`) for hitting walls.
