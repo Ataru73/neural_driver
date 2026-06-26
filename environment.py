@@ -148,8 +148,10 @@ class CarRacingEnv(gym.Env):
         
         # Street Lamp attributes
         self.lamp_pos = np.zeros(2)
+        self.lamp_idx = 0
         self.lamp_color = 0 # 0: green, 1: yellow, 2: red
         self.lamp_cycle_steps = 60 # change color every 60 steps
+        self.lamp_passed_this_lap = False
         
         # Rendering
         self.render_mode = render_mode
@@ -236,12 +238,21 @@ class CarRacingEnv(gym.Env):
                 shift = self.np_random.uniform(-max_offset, max_offset)
                 self.obstacles.append(pt + shift * normal)
                 
-        # Position street lamp randomly on the track centerline
+        # Position street lamp randomly on the track centerline border
         # Select a checkpoint index relative to start_idx to avoid spawning on the car
         lamp_offset = self.np_random.integers(15, self.num_checkpoints - 15)
-        lamp_idx = (start_idx + lamp_offset) % self.num_checkpoints
-        self.lamp_pos = self.centerline[lamp_idx].copy()
+        self.lamp_idx = (start_idx + lamp_offset) % self.num_checkpoints
+        
+        # Calculate normal at lamp_idx to place the lamp on the border
+        next_idx = (self.lamp_idx + 1) % self.num_checkpoints
+        tangent = self.centerline[next_idx] - self.centerline[self.lamp_idx]
+        length = np.linalg.norm(tangent)
+        normal = np.array([-tangent[1], tangent[0]]) / (length if length > 0 else 1.0)
+        
+        # Place lamp on the outer border of the track
+        self.lamp_pos = self.centerline[self.lamp_idx] + (self.track_width / 2.0) * normal
         self.lamp_color = 0
+        self.lamp_passed_this_lap = False
                 
         raw_obs = self._get_obs()
         self.state_history = deque([raw_obs] * self.history_len, maxlen=self.history_len)
@@ -309,13 +320,28 @@ class CarRacingEnv(gym.Env):
         # Update lamp color
         self.lamp_color = (self.total_steps // self.lamp_cycle_steps) % 3
         
-        # Check collision with red lamp
+        # Check collision with red lamp / stop line
         hit_red_lamp = False
-        dist_to_lamp = np.linalg.norm(self.lamp_pos - self.car_pos)
-        if self.lamp_color == 2: # Red
-            if dist_to_lamp < 30.0:
-                hit_red_lamp = True
-                
+        if self.checkpoints_passed == 0:
+            self.lamp_passed_this_lap = False
+            
+        # Compute projection along track direction at the lamp centerline
+        prev_idx = (self.lamp_idx - 1) % self.num_checkpoints
+        next_idx = (self.lamp_idx + 1) % self.num_checkpoints
+        tangent = self.centerline[next_idx] - self.centerline[prev_idx]
+        tangent_unit = tangent / np.linalg.norm(tangent)
+        dist_long = np.dot(self.car_pos - self.centerline[self.lamp_idx], tangent_unit)
+        
+        if not self.lamp_passed_this_lap:
+            if self.lamp_color == 2: # Red
+                # If front of car (approx -12.0) crosses the stop line
+                if dist_long > -12.0:
+                    hit_red_lamp = True
+            else: # Green/Yellow
+                # If center of car fully crosses the stop line
+                if dist_long > 5.0:
+                    self.lamp_passed_this_lap = True
+                    
         collided = off_track or near_collision or hit_obstacle or hit_red_lamp
         
         # Reward function design
@@ -409,11 +435,12 @@ class CarRacingEnv(gym.Env):
             obs[2 * self.num_rays + 3] = 1.0
             
         # Lamp Relative Position:
-        dist_to_lamp = np.linalg.norm(self.lamp_pos - self.car_pos)
+        target_ref = self.centerline[self.lamp_idx]
+        dist_to_lamp = np.linalg.norm(target_ref - self.car_pos)
         obs[2 * self.num_rays + 4] = min(dist_to_lamp / 400.0, 1.0)
         
-        dx = self.lamp_pos[0] - self.car_pos[0]
-        dy = self.lamp_pos[1] - self.car_pos[1]
+        dx = target_ref[0] - self.car_pos[0]
+        dy = target_ref[1] - self.car_pos[1]
         lamp_angle = math.atan2(dy, dx)
         rel_angle = lamp_angle - self.car_angle
         rel_angle = (rel_angle + math.pi) % (2 * math.pi) - math.pi
@@ -554,6 +581,15 @@ class CarRacingEnv(gym.Env):
             # Draw center red dot
             pygame.draw.circle(self.screen, (220, 50, 50), obs_pos.astype(int), int(self.obstacle_radius * 0.2))
             
+        # Draw Stop Line
+        next_idx = (self.lamp_idx + 1) % self.num_checkpoints
+        tangent = self.centerline[next_idx] - self.centerline[self.lamp_idx]
+        length = np.linalg.norm(tangent)
+        normal = np.array([-tangent[1], tangent[0]]) / (length if length > 0 else 1.0)
+        line_start = self.centerline[self.lamp_idx] - (self.track_width / 2.0) * normal
+        line_end = self.centerline[self.lamp_idx] + (self.track_width / 2.0) * normal
+        pygame.draw.line(self.screen, (240, 240, 240), line_start.astype(int), line_end.astype(int), 4)
+
         # Draw Street Lamp (Traffic Light)
         lx, ly = int(self.lamp_pos[0]), int(self.lamp_pos[1])
         # Draw pole
