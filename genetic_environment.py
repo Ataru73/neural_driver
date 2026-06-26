@@ -280,16 +280,18 @@ class GeneticCarRacingEnv:
             tangent = self.centerline[next_idx] - self.centerline[prev_idx]
             tangent_unit = tangent / np.linalg.norm(tangent)
             dist_long = np.dot(self.car_pos[i] - self.centerline[self.lamp_idx], tangent_unit)
+            dist_to_lamp = np.linalg.norm(self.centerline[self.lamp_idx] - self.car_pos[i])
             
             if not self.lamp_passed_this_lap[i]:
-                if self.lamp_color == 2: # Red
-                    # If front of car (approx -12.0) crosses the stop line
-                    if dist_long > -12.0:
-                        hit_red_lamp = True
-                else: # Green/Yellow
-                    # If center of car fully crosses the stop line
-                    if dist_long > 5.0:
-                        self.lamp_passed_this_lap[i] = True
+                if dist_to_lamp < 80.0:
+                    if self.lamp_color == 2: # Red
+                        # If front of car (approx -12.0) crosses the stop line
+                        if dist_long > -12.0:
+                            hit_red_lamp = True
+                    else: # Green/Yellow
+                        # If center of car fully crosses the stop line
+                        if dist_long > 5.0:
+                            self.lamp_passed_this_lap[i] = True
                         
             collided = off_track or near_collision or hit_obstacle or hit_red_lamp
             
