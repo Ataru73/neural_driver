@@ -93,7 +93,7 @@ class GeneticCarRacingEnv:
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.history_len * (self.num_rays + 1),),
+            shape=(self.history_len * (2 * self.num_rays + 1),),
             dtype=np.float32
         )
         
@@ -134,10 +134,31 @@ class GeneticCarRacingEnv:
                 idx = (start_idx + offset) % self.num_checkpoints
                 valid_cps.append(idx)
             
-            if len(valid_cps) >= self.num_obstacles:
-                chosen_cps = np.random.choice(valid_cps, size=self.num_obstacles, replace=False)
-            else:
-                chosen_cps = np.random.choice(valid_cps, size=self.num_obstacles, replace=True)
+            chosen_cps = []
+            min_dist_cps = max(4, self.num_checkpoints // (2 * self.num_obstacles))
+            
+            while len(chosen_cps) < self.num_obstacles and min_dist_cps >= 1:
+                chosen_cps = []
+                shuffled_cps = list(valid_cps)
+                np.random.shuffle(shuffled_cps)
+                for cp in shuffled_cps:
+                    if len(chosen_cps) >= self.num_obstacles:
+                        break
+                    too_close = False
+                    for existing in chosen_cps:
+                        dist = min(abs(cp - existing), self.num_checkpoints - abs(cp - existing))
+                        if dist < min_dist_cps:
+                            too_close = True
+                            break
+                    if not too_close:
+                        chosen_cps.append(cp)
+                min_dist_cps -= 1
+                
+            # If still not enough obstacles due to tight constraints, fall back to random choices
+            if len(chosen_cps) < self.num_obstacles:
+                remaining = self.num_obstacles - len(chosen_cps)
+                fallback_choices = np.random.choice(valid_cps, size=remaining, replace=True)
+                chosen_cps.extend(fallback_choices)
                 
             for idx in chosen_cps:
                 pt = self.centerline[idx]
@@ -151,12 +172,13 @@ class GeneticCarRacingEnv:
                 self.obstacles.append(pt + shift * normal)
                 
         # Initialize and populate history array for all cars
-        self.state_history = np.zeros((self.pop_size, self.history_len, self.num_rays + 1), dtype=np.float32)
+        self.state_history = np.zeros((self.pop_size, self.history_len, 2 * self.num_rays + 1), dtype=np.float32)
         for i in range(self.pop_size):
-            raw_obs = np.zeros(self.num_rays + 1, dtype=np.float32)
-            ray_distances = self._cast_car_rays(i)
-            raw_obs[:self.num_rays] = ray_distances
-            raw_obs[self.num_rays] = self.car_speed[i] / self.max_speed
+            raw_obs = np.zeros(2 * self.num_rays + 1, dtype=np.float32)
+            ray_wall, ray_obs = self._cast_car_rays(i)
+            raw_obs[:self.num_rays] = ray_wall
+            raw_obs[self.num_rays : 2 * self.num_rays] = ray_obs
+            raw_obs[2 * self.num_rays] = self.car_speed[i] / self.max_speed
             
             for h in range(self.history_len):
                 self.state_history[i, h] = raw_obs
@@ -201,12 +223,13 @@ class GeneticCarRacingEnv:
             self._update_car_progress(i)
             
             # Cast rays to compute collision and distances
-            ray_distances = self._cast_car_rays(i)
+            ray_distances_wall, ray_distances_obstacle = self._cast_car_rays(i)
             
             # Update state history for this car
-            raw_obs = np.zeros(self.num_rays + 1, dtype=np.float32)
-            raw_obs[:self.num_rays] = ray_distances
-            raw_obs[self.num_rays] = self.car_speed[i] / self.max_speed
+            raw_obs = np.zeros(2 * self.num_rays + 1, dtype=np.float32)
+            raw_obs[:self.num_rays] = ray_distances_wall
+            raw_obs[self.num_rays : 2 * self.num_rays] = ray_distances_obstacle
+            raw_obs[2 * self.num_rays] = self.car_speed[i] / self.max_speed
             
             self.state_history[i] = np.roll(self.state_history[i], -1, axis=0)
             self.state_history[i, -1] = raw_obs
@@ -214,7 +237,8 @@ class GeneticCarRacingEnv:
             # Check collisions
             dist_to_centerline = np.linalg.norm(self.car_pos[i] - self.centerline[self.current_checkpoint[i]])
             off_track = dist_to_centerline > (self.track_width / 2.0 - self.car_radius + 5.0)
-            near_collision = np.any(ray_distances * self.max_ray_len < self.car_radius)
+            overall_ray_distances = np.minimum(ray_distances_wall, ray_distances_obstacle)
+            near_collision = np.any(overall_ray_distances * self.max_ray_len < self.car_radius)
             
             # Check obstacle collisions
             hit_obstacle = False
@@ -283,7 +307,8 @@ class GeneticCarRacingEnv:
         self.current_checkpoint[i] = best_idx
         
     def _cast_car_rays(self, i):
-        ray_distances = []
+        ray_distances_wall = []
+        ray_distances_obstacle = []
         for angle_deg in self.ray_angles:
             theta = self.car_angle[i] + math.radians(angle_deg)
             r = np.array([math.cos(theta), math.sin(theta)]) * self.max_ray_len
@@ -291,7 +316,7 @@ class GeneticCarRacingEnv:
             denom = r[0] * self.S[:, 1] - r[1] * self.S[:, 0]
             mask = np.abs(denom) > 1e-6
             
-            min_t = 1.0
+            boundary_t = 1.0
             if np.any(mask):
                 q_p_x = self.Q[mask, 0] - self.car_pos[i, 0]
                 q_p_y = self.Q[mask, 1] - self.car_pos[i, 1]
@@ -302,17 +327,19 @@ class GeneticCarRacingEnv:
                 valid = (t_val >= 0.0) & (t_val <= 1.0) & (u_val >= 0.0) & (u_val <= 1.0)
                 valid_t = t_val[valid]
                 if len(valid_t) > 0:
-                    min_t = float(np.min(valid_t))
+                    boundary_t = float(np.min(valid_t))
                     
             # Check obstacle intersections
+            obstacle_t = 1.0
             for obs_pos in self.obstacles:
                 t_obs = self._intersect_ray_circle(self.car_pos[i], r, obs_pos, self.obstacle_radius)
-                if t_obs < min_t:
-                    min_t = t_obs
+                if t_obs < obstacle_t:
+                    obstacle_t = t_obs
                     
-            ray_distances.append(min_t)
+            ray_distances_wall.append(boundary_t)
+            ray_distances_obstacle.append(obstacle_t)
                 
-        return np.array(ray_distances, dtype=np.float32)
+        return np.array(ray_distances_wall, dtype=np.float32), np.array(ray_distances_obstacle, dtype=np.float32)
 
     def _intersect_ray_circle(self, p, r, center, radius):
         v = p - center
@@ -339,7 +366,7 @@ class GeneticCarRacingEnv:
         return 1.0
         
     def _get_observations(self):
-        obs = np.zeros((self.pop_size, self.history_len * (self.num_rays + 1)), dtype=np.float32)
+        obs = np.zeros((self.pop_size, self.history_len * (2 * self.num_rays + 1)), dtype=np.float32)
         for i in range(self.pop_size):
             if not self.active[i]:
                 continue
@@ -410,15 +437,28 @@ class GeneticCarRacingEnv:
             
         # Draw Raycasts ONLY for the leader (to keep screen clean)
         if leader_idx != -1:
-            ray_distances = self._cast_car_rays(leader_idx)
-            for angle_deg, dist in zip(self.ray_angles, ray_distances):
+            ray_distances_wall, ray_distances_obstacle = self._cast_car_rays(leader_idx)
+            for angle_deg, dist_wall, dist_obs in zip(self.ray_angles, ray_distances_wall, ray_distances_obstacle):
                 theta = self.car_angle[leader_idx] + math.radians(angle_deg)
-                actual_len = dist * self.max_ray_len
-                end_x = self.car_pos[leader_idx, 0] + actual_len * math.cos(theta)
-                end_y = self.car_pos[leader_idx, 1] + actual_len * math.sin(theta)
-                color = (int(255 * (1 - dist)), int(255 * dist), 0)
-                pygame.draw.line(self.screen, color, self.car_pos[leader_idx].astype(int), (int(end_x), int(end_y)), 1)
-                pygame.draw.circle(self.screen, color, (int(end_x), int(end_y)), 3)
+                
+                # Wall intersection
+                wall_len = dist_wall * self.max_ray_len
+                w_x = self.car_pos[leader_idx, 0] + wall_len * math.cos(theta)
+                w_y = self.car_pos[leader_idx, 1] + wall_len * math.sin(theta)
+                
+                color_wall = (int(255 * (1 - dist_wall)), int(255 * dist_wall), 0)
+                pygame.draw.line(self.screen, color_wall, self.car_pos[leader_idx].astype(int), (int(w_x), int(w_y)), 1)
+                pygame.draw.circle(self.screen, color_wall, (int(w_x), int(w_y)), 3)
+                
+                # Obstacle intersection (cyan indicator)
+                if dist_obs < 1.0:
+                    obs_len = dist_obs * self.max_ray_len
+                    o_x = self.car_pos[leader_idx, 0] + obs_len * math.cos(theta)
+                    o_y = self.car_pos[leader_idx, 1] + obs_len * math.sin(theta)
+                    
+                    cyan = (0, 255, 255)
+                    pygame.draw.line(self.screen, cyan, self.car_pos[leader_idx].astype(int), (int(o_x), int(o_y)), 1)
+                    pygame.draw.circle(self.screen, cyan, (int(o_x), int(o_y)), 4)
                 
         # Draw HUD info
         active_count = np.sum(self.active)
