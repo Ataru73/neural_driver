@@ -56,10 +56,17 @@ def train_genetic():
         
     num_obstacles = 0
     random_start = True
+    num_generations = 100
     for arg in sys.argv[:]:
         if arg.startswith("--obstacles="):
             try:
                 num_obstacles = int(arg.split("=")[1])
+            except ValueError:
+                pass
+            sys.argv.remove(arg)
+        elif arg.startswith("--generations="):
+            try:
+                num_generations = int(arg.split("=")[1])
             except ValueError:
                 pass
             sys.argv.remove(arg)
@@ -73,7 +80,6 @@ def train_genetic():
         
     # Hyperparameters
     pop_size = 40
-    num_generations = 100
     elite_size = 4        # Top 10% kept directly
     parents_pool_size = 16 # Top 40% used for reproduction
     

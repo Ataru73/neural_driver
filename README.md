@@ -76,6 +76,12 @@ python train_genetic.py --render
 ```
 - *Crashed or stagnant cars turn semi-transparent red, while the current generation leader is highlighted in cyan, projecting its active laser sensors.*
 
+#### Set the Number of Generations:
+By default, the Genetic Algorithm runs for 100 generations. You can change this using the `--generations=N` parameter:
+```bash
+python train_genetic.py --generations=50
+```
+
 #### Resume Genetic Training from a Pretrained Model:
 You can seed a new genetic population using a pretrained champion model (from either DQN or GA):
 ```bash
