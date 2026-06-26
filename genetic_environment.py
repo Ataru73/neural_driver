@@ -89,13 +89,19 @@ class GeneticCarRacingEnv:
         self.generation = 1
         
         # Frame stacking for population
-        self.history_len = 3
+        self.history_len = 6
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.history_len * (2 * self.num_rays + 1),),
+            shape=(self.history_len * (2 * self.num_rays + 1 + 5),),
             dtype=np.float32
         )
+        
+        # Street Lamp attributes
+        self.lamp_pos = np.zeros(2)
+        self.lamp_color = 0 # 0: green, 1: yellow, 2: red
+        self.lamp_cycle_steps = 60
+        self.env_steps = 0
         
     def reset(self, generation=None, random_start=False):
         if generation is not None:
@@ -171,15 +177,19 @@ class GeneticCarRacingEnv:
                 shift = np.random.uniform(-max_offset, max_offset)
                 self.obstacles.append(pt + shift * normal)
                 
+        # Position street lamp randomly on the track centerline
+        # Select a checkpoint index relative to start_idx to avoid spawning on the car
+        lamp_offset = np.random.randint(15, self.num_checkpoints - 15)
+        lamp_idx = (start_idx + lamp_offset) % self.num_checkpoints
+        self.lamp_pos = self.centerline[lamp_idx].copy()
+        self.lamp_color = 0
+        self.env_steps = 0
+        
         # Initialize and populate history array for all cars
-        self.state_history = np.zeros((self.pop_size, self.history_len, 2 * self.num_rays + 1), dtype=np.float32)
+        self.state_history = np.zeros((self.pop_size, self.history_len, 2 * self.num_rays + 1 + 5), dtype=np.float32)
         for i in range(self.pop_size):
-            raw_obs = np.zeros(2 * self.num_rays + 1, dtype=np.float32)
             ray_wall, ray_obs = self._cast_car_rays(i)
-            raw_obs[:self.num_rays] = ray_wall
-            raw_obs[self.num_rays : 2 * self.num_rays] = ray_obs
-            raw_obs[2 * self.num_rays] = self.car_speed[i] / self.max_speed
-            
+            raw_obs = self._build_car_raw_obs(i, ray_wall, ray_obs)
             for h in range(self.history_len):
                 self.state_history[i, h] = raw_obs
                 
@@ -190,6 +200,9 @@ class GeneticCarRacingEnv:
         Step all cars in the population.
         actions: list or array of action indices of length pop_size
         """
+        self.env_steps += 1
+        self.lamp_color = (self.env_steps // self.lamp_cycle_steps) % 3
+        
         for i in range(self.pop_size):
             if not self.active[i]:
                 continue
@@ -226,10 +239,7 @@ class GeneticCarRacingEnv:
             ray_distances_wall, ray_distances_obstacle = self._cast_car_rays(i)
             
             # Update state history for this car
-            raw_obs = np.zeros(2 * self.num_rays + 1, dtype=np.float32)
-            raw_obs[:self.num_rays] = ray_distances_wall
-            raw_obs[self.num_rays : 2 * self.num_rays] = ray_distances_obstacle
-            raw_obs[2 * self.num_rays] = self.car_speed[i] / self.max_speed
+            raw_obs = self._build_car_raw_obs(i, ray_distances_wall, ray_distances_obstacle)
             
             self.state_history[i] = np.roll(self.state_history[i], -1, axis=0)
             self.state_history[i, -1] = raw_obs
@@ -248,7 +258,14 @@ class GeneticCarRacingEnv:
                     hit_obstacle = True
                     break
                     
-            collided = off_track or near_collision or hit_obstacle
+            # Check collision with red lamp
+            hit_red_lamp = False
+            dist_to_lamp = np.linalg.norm(self.lamp_pos - self.car_pos[i])
+            if self.lamp_color == 2: # Red
+                if dist_to_lamp < 30.0:
+                    hit_red_lamp = True
+                    
+            collided = off_track or near_collision or hit_obstacle or hit_red_lamp
             
             # Update Fitness
             # Base survival reward
@@ -365,8 +382,34 @@ class GeneticCarRacingEnv:
             return min(valid_ts)
         return 1.0
         
+    def _build_car_raw_obs(self, idx, ray_wall, ray_obs):
+        obs = np.zeros(2 * self.num_rays + 1 + 5, dtype=np.float32)
+        obs[:self.num_rays] = ray_wall
+        obs[self.num_rays : 2 * self.num_rays] = ray_obs
+        obs[2 * self.num_rays] = self.car_speed[idx] / self.max_speed
+        
+        # Lamp Color One-hot:
+        if self.lamp_color == 0:
+            obs[2 * self.num_rays + 1] = 1.0
+        elif self.lamp_color == 1:
+            obs[2 * self.num_rays + 2] = 1.0
+        elif self.lamp_color == 2:
+            obs[2 * self.num_rays + 3] = 1.0
+            
+        # Lamp Relative Position:
+        dist_to_lamp = np.linalg.norm(self.lamp_pos - self.car_pos[idx])
+        obs[2 * self.num_rays + 4] = min(dist_to_lamp / 400.0, 1.0)
+        
+        dx = self.lamp_pos[0] - self.car_pos[idx, 0]
+        dy = self.lamp_pos[1] - self.car_pos[idx, 1]
+        lamp_angle = math.atan2(dy, dx)
+        rel_angle = lamp_angle - self.car_angle[idx]
+        rel_angle = (rel_angle + math.pi) % (2 * math.pi) - math.pi
+        obs[2 * self.num_rays + 5] = rel_angle / math.pi
+        return obs
+
     def _get_observations(self):
-        obs = np.zeros((self.pop_size, self.history_len * (2 * self.num_rays + 1)), dtype=np.float32)
+        obs = np.zeros((self.pop_size, self.history_len * (2 * self.num_rays + 1 + 5)), dtype=np.float32)
         for i in range(self.pop_size):
             if not self.active[i]:
                 continue
@@ -397,6 +440,26 @@ class GeneticCarRacingEnv:
             pygame.draw.circle(self.screen, (220, 50, 50), obs_pos.astype(int), int(self.obstacle_radius))
             pygame.draw.circle(self.screen, (240, 240, 240), obs_pos.astype(int), int(self.obstacle_radius * 0.6))
             pygame.draw.circle(self.screen, (220, 50, 50), obs_pos.astype(int), int(self.obstacle_radius * 0.2))
+            
+        # Draw Street Lamp (Traffic Light)
+        lx, ly = int(self.lamp_pos[0]), int(self.lamp_pos[1])
+        # Draw pole
+        pygame.draw.line(self.screen, (150, 150, 150), (lx, ly), (lx, ly - 20), 4)
+        # Draw box
+        box_w, box_h = 16, 36
+        pygame.draw.rect(self.screen, (30, 30, 30), (lx - box_w//2, ly - 20 - box_h//2, box_w, box_h))
+        # Draw lights
+        colors = {
+            2: ((255, 0, 0), (80, 0, 0)),     # Red
+            1: ((255, 255, 0), (80, 80, 0)), # Yellow
+            0: ((0, 255, 0), (0, 80, 0))     # Green
+        }
+        c_red = colors[2][0] if self.lamp_color == 2 else colors[2][1]
+        pygame.draw.circle(self.screen, c_red, (lx, ly - 20 - 10), 4)
+        c_yel = colors[1][0] if self.lamp_color == 1 else colors[1][1]
+        pygame.draw.circle(self.screen, c_yel, (lx, ly - 20), 4)
+        c_grn = colors[0][0] if self.lamp_color == 0 else colors[0][1]
+        pygame.draw.circle(self.screen, c_grn, (lx, ly - 20 + 10), 4)
         
         # Find leading active car (greatest checkpoint or highest fitness)
         leader_idx = -1
@@ -469,7 +532,11 @@ class GeneticCarRacingEnv:
         active_text = font.render(f"Active Cars: {active_count}/{self.pop_size}", True, (255, 255, 255))
         fit_text = font.render(f"Best Fitness: {best_fitness:.1f}", True, (255, 255, 255))
         
-        hud_bg = pygame.Surface((250, 100))
+        lamp_colors = ["GREEN", "YELLOW", "RED"]
+        lamp_rgb = [(0, 255, 0), (255, 255, 0), (255, 50, 50)]
+        lamp_text = font.render(f"Lamp: {lamp_colors[self.lamp_color]}", True, lamp_rgb[self.lamp_color])
+        
+        hud_bg = pygame.Surface((250, 125))
         hud_bg.fill((0, 0, 0))
         hud_bg.set_alpha(150)
         self.screen.blit(hud_bg, (10, 10))
@@ -477,6 +544,7 @@ class GeneticCarRacingEnv:
         self.screen.blit(gen_text, (20, 20))
         self.screen.blit(active_text, (20, 45))
         self.screen.blit(fit_text, (20, 70))
+        self.screen.blit(lamp_text, (20, 95))
         
         pygame.event.pump()
         pygame.display.flip()

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class DQN(nn.Module):
-    def __init__(self, input_dim=8, output_dim=9):
+    def __init__(self, input_dim=168, output_dim=9):
         super(DQN, self).__init__()
         
         self.network = nn.Sequential(

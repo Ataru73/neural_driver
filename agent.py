@@ -27,7 +27,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 class DQNAgent:
-    def __init__(self, state_dim=8, action_dim=9, lr=3e-4, gamma=0.99, epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=20000, buffer_capacity=100000, batch_size=128, tau=0.001, min_replay_size=2000):
+    def __init__(self, state_dim=168, action_dim=9, lr=3e-4, gamma=0.99, epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=20000, buffer_capacity=100000, batch_size=128, tau=0.001, min_replay_size=2000):
 
         self.state_dim = state_dim
         self.action_dim = action_dim

@@ -135,13 +135,21 @@ class CarRacingEnv(gym.Env):
         # Observation Space:
         # [ray_wall_0..10, ray_obs_0..10, speed] stacked history_len times
         # All values normalized to [0, 1]
-        self.history_len = 3
+        self.history_len = 6
+        # Observation Space:
+        # [ray_wall_0..10, ray_obs_0..10, speed] + [lamp_green, lamp_yellow, lamp_red, lamp_dist, lamp_angle]
+        # stacked history_len times
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.history_len * (2 * self.num_rays + 1),),
+            shape=(self.history_len * (2 * self.num_rays + 1 + 5),),
             dtype=np.float32
         )
+        
+        # Street Lamp attributes
+        self.lamp_pos = np.zeros(2)
+        self.lamp_color = 0 # 0: green, 1: yellow, 2: red
+        self.lamp_cycle_steps = 60 # change color every 60 steps
         
         # Rendering
         self.render_mode = render_mode
@@ -228,6 +236,13 @@ class CarRacingEnv(gym.Env):
                 shift = self.np_random.uniform(-max_offset, max_offset)
                 self.obstacles.append(pt + shift * normal)
                 
+        # Position street lamp randomly on the track centerline
+        # Select a checkpoint index relative to start_idx to avoid spawning on the car
+        lamp_offset = self.np_random.integers(15, self.num_checkpoints - 15)
+        lamp_idx = (start_idx + lamp_offset) % self.num_checkpoints
+        self.lamp_pos = self.centerline[lamp_idx].copy()
+        self.lamp_color = 0
+                
         raw_obs = self._get_obs()
         self.state_history = deque([raw_obs] * self.history_len, maxlen=self.history_len)
         observation = np.concatenate(self.state_history, dtype=np.float32)
@@ -291,7 +306,17 @@ class CarRacingEnv(gym.Env):
                 hit_obstacle = True
                 break
                 
-        collided = off_track or near_collision or hit_obstacle
+        # Update lamp color
+        self.lamp_color = (self.total_steps // self.lamp_cycle_steps) % 3
+        
+        # Check collision with red lamp
+        hit_red_lamp = False
+        dist_to_lamp = np.linalg.norm(self.lamp_pos - self.car_pos)
+        if self.lamp_color == 2: # Red
+            if dist_to_lamp < 30.0:
+                hit_red_lamp = True
+                
+        collided = off_track or near_collision or hit_obstacle or hit_red_lamp
         
         # Reward function design
         reward = 0.0
@@ -348,10 +373,7 @@ class CarRacingEnv(gym.Env):
             truncated = True
             
         # Prepare observation
-        raw_obs = np.zeros(2 * self.num_rays + 1, dtype=np.float32)
-        raw_obs[:self.num_rays] = ray_distances_wall
-        raw_obs[self.num_rays : 2 * self.num_rays] = ray_distances_obstacle
-        raw_obs[2 * self.num_rays] = self.car_speed / self.max_speed
+        raw_obs = self._build_raw_obs(ray_distances_wall, ray_distances_obstacle)
         
         self.state_history.append(raw_obs)
         observation = np.concatenate(self.state_history, dtype=np.float32)
@@ -370,13 +392,37 @@ class CarRacingEnv(gym.Env):
             
         return observation, reward, terminated, truncated, info
         
-    def _get_obs(self):
-        ray_wall, ray_obs = self._cast_all_rays()
-        obs = np.zeros(2 * self.num_rays + 1, dtype=np.float32)
+    def _build_raw_obs(self, ray_wall, ray_obs):
+        # 2 * self.num_rays + 1 (lidar + speed) + 5 (lamp info) = 28 features
+        obs = np.zeros(2 * self.num_rays + 1 + 5, dtype=np.float32)
         obs[:self.num_rays] = ray_wall
         obs[self.num_rays : 2 * self.num_rays] = ray_obs
         obs[2 * self.num_rays] = self.car_speed / self.max_speed
+        
+        # Lamp features:
+        # Lamp Color One-hot: [is_green, is_yellow, is_red]
+        if self.lamp_color == 0:
+            obs[2 * self.num_rays + 1] = 1.0
+        elif self.lamp_color == 1:
+            obs[2 * self.num_rays + 2] = 1.0
+        elif self.lamp_color == 2:
+            obs[2 * self.num_rays + 3] = 1.0
+            
+        # Lamp Relative Position:
+        dist_to_lamp = np.linalg.norm(self.lamp_pos - self.car_pos)
+        obs[2 * self.num_rays + 4] = min(dist_to_lamp / 400.0, 1.0)
+        
+        dx = self.lamp_pos[0] - self.car_pos[0]
+        dy = self.lamp_pos[1] - self.car_pos[1]
+        lamp_angle = math.atan2(dy, dx)
+        rel_angle = lamp_angle - self.car_angle
+        rel_angle = (rel_angle + math.pi) % (2 * math.pi) - math.pi
+        obs[2 * self.num_rays + 5] = rel_angle / math.pi
         return obs
+        
+    def _get_obs(self):
+        ray_wall, ray_obs = self._cast_all_rays()
+        return self._build_raw_obs(ray_wall, ray_obs)
         
     def _update_progress(self):
         # Local search around current checkpoint
@@ -508,6 +554,26 @@ class CarRacingEnv(gym.Env):
             # Draw center red dot
             pygame.draw.circle(self.screen, (220, 50, 50), obs_pos.astype(int), int(self.obstacle_radius * 0.2))
             
+        # Draw Street Lamp (Traffic Light)
+        lx, ly = int(self.lamp_pos[0]), int(self.lamp_pos[1])
+        # Draw pole
+        pygame.draw.line(self.screen, (150, 150, 150), (lx, ly), (lx, ly - 20), 4)
+        # Draw box
+        box_w, box_h = 16, 36
+        pygame.draw.rect(self.screen, (30, 30, 30), (lx - box_w//2, ly - 20 - box_h//2, box_w, box_h))
+        # Draw lights
+        colors = {
+            2: ((255, 0, 0), (80, 0, 0)),     # Red
+            1: ((255, 255, 0), (80, 80, 0)), # Yellow
+            0: ((0, 255, 0), (0, 80, 0))     # Green
+        }
+        c_red = colors[2][0] if self.lamp_color == 2 else colors[2][1]
+        pygame.draw.circle(self.screen, c_red, (lx, ly - 20 - 10), 4)
+        c_yel = colors[1][0] if self.lamp_color == 1 else colors[1][1]
+        pygame.draw.circle(self.screen, c_yel, (lx, ly - 20), 4)
+        c_grn = colors[0][0] if self.lamp_color == 0 else colors[0][1]
+        pygame.draw.circle(self.screen, c_grn, (lx, ly - 20 + 10), 4)
+            
         # Draw Raycasts
         ray_distances_wall, ray_distances_obstacle = self._cast_all_rays()
         for angle_deg, dist_wall, dist_obs in zip(self.ray_angles, ray_distances_wall, ray_distances_obstacle):
@@ -565,7 +631,11 @@ class CarRacingEnv(gym.Env):
         laps_text = font.render(f"Laps: {self.lap_count}", True, (255, 255, 255))
         steps_text = font.render(f"Steps: {self.total_steps}", True, (255, 255, 255))
         
-        hud_bg = pygame.Surface((250, 120))
+        lamp_colors = ["GREEN", "YELLOW", "RED"]
+        lamp_rgb = [(0, 255, 0), (255, 255, 0), (255, 50, 50)]
+        lamp_text = font.render(f"Lamp: {lamp_colors[self.lamp_color]}", True, lamp_rgb[self.lamp_color])
+        
+        hud_bg = pygame.Surface((250, 145))
         hud_bg.fill((0, 0, 0))
         hud_bg.set_alpha(150)
         self.screen.blit(hud_bg, (10, 10))
@@ -574,6 +644,7 @@ class CarRacingEnv(gym.Env):
         self.screen.blit(checkpoint_text, (20, 45))
         self.screen.blit(laps_text, (20, 70))
         self.screen.blit(steps_text, (20, 95))
+        self.screen.blit(lamp_text, (20, 120))
         
         if self.render_mode == "human":
             pygame.event.pump()
