@@ -161,3 +161,16 @@ To train or enjoy with obstacles, pass the `--obstacles=N` argument (where `N` i
   - Positive reward (`+15`) for hitting sequential checkpoints in the correct order.
   - Alignment reward based on the cosine of the heading angle error compared to the track centerline tangent.
   - Collision penalty (`-100`) for hitting walls.
+
+---
+
+## Street Lamp (Traffic Signal)
+
+To simulate intersection or traffic signal navigation, a **Street Lamp (Traffic Signal)** is placed dynamically on the racetrack:
+* **Position**: Set randomly along the outer track border of a centerline checkpoint during `reset()`.
+* **Stop Line**: A solid white line is drawn across the width of the racetrack at the lamp's checkpoint.
+* **Alternating Colors**: The lamp color cycles dynamically: Green $\rightarrow$ Yellow $\rightarrow$ Red $\rightarrow$ Green every 60 steps.
+* **Collision Check**: If the lamp is **Red**, cars must stop before the stop line. If any part of the car crosses the line (`dist_long > -12.0`), it is treated as **crashed/collided**. Once a car successfully crosses the line while it is **Green/Yellow**, it can proceed freely.
+* **Sensor Visibility Constraint (DQN Input)**:
+  - The car can detect the lamp's state (color one-hot, relative distance, and relative angle) **only if** the lamp checkpoint is in front of the car (`cos(rel_angle) >= 0`) and within the maximum sensor/laser distance (`<= 250.0`).
+  - Outside of this range, the observation values are zeroed out (lamp color set to `[0, 0, 0]`, distance to `1.0`, and angle to `0.0`).

@@ -414,25 +414,34 @@ class GeneticCarRacingEnv:
         obs[self.num_rays : 2 * self.num_rays] = ray_obs
         obs[2 * self.num_rays] = self.car_speed[idx] / self.max_speed
         
-        # Lamp Color One-hot:
-        if self.lamp_color == 0:
-            obs[2 * self.num_rays + 1] = 1.0
-        elif self.lamp_color == 1:
-            obs[2 * self.num_rays + 2] = 1.0
-        elif self.lamp_color == 2:
-            obs[2 * self.num_rays + 3] = 1.0
-            
-        # Lamp Relative Position:
+        # Calculate relative position to centerline lamp checkpoint
         target_ref = self.centerline[self.lamp_idx]
         dist_to_lamp = np.linalg.norm(target_ref - self.car_pos[idx])
-        obs[2 * self.num_rays + 4] = min(dist_to_lamp / 400.0, 1.0)
         
         dx = target_ref[0] - self.car_pos[idx, 0]
         dy = target_ref[1] - self.car_pos[idx, 1]
         lamp_angle = math.atan2(dy, dx)
         rel_angle = lamp_angle - self.car_angle[idx]
         rel_angle = (rel_angle + math.pi) % (2 * math.pi) - math.pi
-        obs[2 * self.num_rays + 5] = rel_angle / math.pi
+        
+        # The car can know the state of the lamp only if it is in front of it and at a distance <= max_ray_len
+        if dist_to_lamp <= self.max_ray_len and math.cos(rel_angle) >= 0.0:
+            # Lamp Color One-hot:
+            if self.lamp_color == 0:
+                obs[2 * self.num_rays + 1] = 1.0
+            elif self.lamp_color == 1:
+                obs[2 * self.num_rays + 2] = 1.0
+            elif self.lamp_color == 2:
+                obs[2 * self.num_rays + 3] = 1.0
+                
+            obs[2 * self.num_rays + 4] = dist_to_lamp / self.max_ray_len
+            obs[2 * self.num_rays + 5] = rel_angle / math.pi
+        else:
+            # Default values when lamp is out of range / not in front
+            # Color one-hot is [0, 0, 0] (already zeroed by np.zeros)
+            obs[2 * self.num_rays + 4] = 1.0 # Max distance
+            obs[2 * self.num_rays + 5] = 0.0 # Straight ahead
+            
         return obs
 
     def _get_observations(self):
