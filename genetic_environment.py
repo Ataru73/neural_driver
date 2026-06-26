@@ -299,6 +299,14 @@ class GeneticCarRacingEnv:
             # Base survival reward
             self.fitness[i] += 0.1
             
+            # Fitness shaping for stopping at red lights
+            if self.lamp_color == 2 and not self.lamp_passed_this_lap[i]: # Red
+                if dist_to_lamp < 100.0 and dist_long < -5.0:
+                    if self.car_speed[i] < 1.0:
+                        self.fitness[i] += 0.35 # Reward for stopping / waiting
+                    else:
+                        self.fitness[i] -= 0.1 # Penalize for driving fast towards red light
+            
             # Check for checkpoint completion
             dist_to_next_cp = np.linalg.norm(self.car_pos[i] - self.centerline[self.next_checkpoint[i]])
             if dist_to_next_cp < (self.track_width * 0.8) and self.current_checkpoint[i] == self.next_checkpoint[i]:

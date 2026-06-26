@@ -354,6 +354,15 @@ class CarRacingEnv(gym.Env):
         # 1. Base step penalty to encourage speed and completion
         reward -= 0.1
         
+        # Reward shaping for stopping at red lights
+        if self.lamp_color == 2 and not self.lamp_passed_this_lap: # Red
+            # If the car is approaching the stop line (within 100 pixels, not yet crossed)
+            if dist_to_lamp < 100.0 and dist_long < -5.0:
+                if self.car_speed < 1.0:
+                    reward += 0.4 # Reward for stopping / waiting
+                else:
+                    reward -= 0.15 # Penalize for driving fast towards red light
+        
         # 2. Progress reward (passing checkpoints)
         checkpoint_passed = False
         dist_to_next_cp = np.linalg.norm(self.car_pos - self.centerline[self.next_checkpoint])
