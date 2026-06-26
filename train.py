@@ -10,6 +10,20 @@ def train():
     # Directories
     os.makedirs("models", exist_ok=True)
     
+    # Parse CLI arguments
+    num_obstacles = 0
+    random_start = True
+    for arg in sys.argv[:]:
+        if arg.startswith("--obstacles="):
+            try:
+                num_obstacles = int(arg.split("=")[1])
+            except ValueError:
+                pass
+            sys.argv.remove(arg)
+        elif arg == "--fixed-start":
+            random_start = False
+            sys.argv.remove(arg)
+            
     # Check if a model checkpoint was provided to resume training
     model_path = None
     if len(sys.argv) > 1:
@@ -18,12 +32,13 @@ def train():
     # Hyperparameters
     num_episodes = 400
     batch_size = 128
-    learning_rate = 5e-4
+    learning_rate = 3e-4
     gamma = 0.98
     epsilon_decay = 25000 # decay speed (in agent steps)
+
     
     # Environment & Agent
-    env = CarRacingEnv(render_mode=None)
+    env = CarRacingEnv(render_mode=None, num_obstacles=num_obstacles)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
     
@@ -57,9 +72,12 @@ def train():
     print("\n--- Starting Training ---")
     print(f"State space: {state_dim}, Action space: {action_dim}")
     print(f"Total episodes: {num_episodes}")
+    print(f"Warm-up phase: Network updates will start once replay buffer has {agent.min_replay_size} steps.")
+
     
     for episode in range(1, num_episodes + 1):
-        state, info = env.reset()
+        state, info = env.reset(random_start=random_start)
+
         total_reward = 0
         steps = 0
         max_cp = 0
@@ -76,8 +94,10 @@ def train():
             # PyTorch models prefer terminated for DQN targets, let's pass terminated or truncated
             agent.memory.push(state, action, reward, next_state, terminated)
             
-            # Learn
-            loss = agent.update()
+            # Learn every 4 steps to prevent overfitting and stabilize learning
+            if agent.steps_done % 4 == 0:
+                loss = agent.update()
+
             
             state = next_state
             total_reward += reward

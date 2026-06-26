@@ -5,6 +5,16 @@ from environment import CarRacingEnv
 from agent import DQNAgent
 
 def enjoy():
+    # Parse CLI arguments
+    num_obstacles = 0
+    for arg in sys.argv[:]:
+        if arg.startswith("--obstacles="):
+            try:
+                num_obstacles = int(arg.split("=")[1])
+            except ValueError:
+                pass
+            sys.argv.remove(arg)
+            
     # Check if a model checkpoint was provided, default to best_model.pt
     model_path = "models/best_model.pt"
     if len(sys.argv) > 1:
@@ -13,7 +23,8 @@ def enjoy():
     print(f"Loading model from: {model_path}")
     
     # Environment Setup (Human render mode)
-    env = CarRacingEnv(render_mode="human")
+    env = CarRacingEnv(render_mode="human", num_obstacles=num_obstacles)
+
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
     
@@ -89,14 +100,18 @@ def enjoy():
         # Step the environment
         state, reward, terminated, truncated, info = env.step(action)
         
-        # Display feedback in console on collision
-        if info["collided"]:
-            print("Collision detected! Resetting track...")
+        # Reset checks
+        if terminated:
+            if info.get("collided", False):
+                print("Collision detected! Resetting track...")
+            else:
+                print("Laps completed successfully! Resetting track...")
             state, info = env.reset()
             
-        if truncated:
+        elif truncated:
             print("Car stagnated! Resetting track...")
             state, info = env.reset()
+
             
     env.close()
 

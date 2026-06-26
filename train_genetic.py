@@ -54,6 +54,19 @@ def train_genetic():
         render_mode = "human"
         sys.argv.remove("--render")
         
+    num_obstacles = 0
+    random_start = True
+    for arg in sys.argv[:]:
+        if arg.startswith("--obstacles="):
+            try:
+                num_obstacles = int(arg.split("=")[1])
+            except ValueError:
+                pass
+            sys.argv.remove(arg)
+        elif arg == "--fixed-start":
+            random_start = False
+            sys.argv.remove(arg)
+            
     model_path = None
     if len(sys.argv) > 1:
         model_path = sys.argv[1]
@@ -68,8 +81,9 @@ def train_genetic():
     mutation_scale = 0.1
     
     # Env setup
-    env = GeneticCarRacingEnv(pop_size=pop_size, render_mode=render_mode)
-    state_dim = 8
+    env = GeneticCarRacingEnv(pop_size=pop_size, render_mode=render_mode, num_obstacles=num_obstacles)
+
+    state_dim = env.observation_space.shape[0]
     action_dim = 9
     
     # Initialize networks
@@ -124,7 +138,8 @@ def train_genetic():
     for gen_idx in range(num_generations):
         gen = start_gen + gen_idx
         # Reset env
-        obs = env.reset(generation=gen)
+        obs = env.reset(generation=gen, random_start=random_start)
+
         done = False
         
         # Load chromosomes into models

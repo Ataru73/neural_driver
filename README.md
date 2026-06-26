@@ -108,9 +108,47 @@ python enjoy.py models/genetic_best.pt  # or models/best_model.pt
 
 ---
 
+## Fixed Starting Position
+
+By default, training episodes randomly spawn the car at different checkpoints along the racetrack. This helps the network learn to recover from various configurations and corners. However, if you want the car to always spawn at the main starting line (checkpoint 0), you can suppress the starting-position randomness by passing the `--fixed-start` argument:
+
+* **Train DQN with a fixed starting position**:
+  ```bash
+  python train.py --fixed-start
+  ```
+* **Train Genetic Algorithm with a fixed starting position visually**:
+  ```bash
+  python train_genetic.py --fixed-start --render
+  ```
+
+---
+
+## Racetrack Obstacles
+
+You can inject random obstacles onto the racetrack to make the driving task more challenging and force the networks to learn obstacle-avoidance maneuvers. Obstacles are drawn as circular striped traffic drums (red/white) and are placed dynamically within the road boundaries at random checkpoints (excluding the starting zone).
+
+To train or enjoy with obstacles, pass the `--obstacles=N` argument (where `N` is the number of obstacles):
+
+* **Train DQN with 5 obstacles**:
+  ```bash
+  python train.py --obstacles=5
+  ```
+* **Train Genetic Algorithm with 10 obstacles visually**:
+  ```bash
+  python train_genetic.py --obstacles=10 --render
+  ```
+* **Watch or drive with 8 obstacles**:
+  ```bash
+  python enjoy.py models/genetic_best.pt --obstacles=8
+  ```
+
+---
+
 ## Technical Details
 
-- **Sensor Inputs (State Space)**: 7 normalized distance measurements from laser raycasts angled at `[-90°, -45°, -20°, 0°, 20°, 45°, 90°]` relative to the car's heading, plus the car's normalized current speed (8-dimensional state vector).
+
+- **Sensor Inputs (State Space)**: 11 normalized distance measurements from laser raycasts angled at `[-90°, -70°, -45°, -30°, -15°, 0°, 15°, 30°, 45°, 70°, 90°]` relative to the car's heading, plus the car's normalized current speed.
+- **Short-Term Memory (Frame Stacking)**: To help the network handle obstacles and coordinate complex maneuvers, **Frame Stacking** is implemented. The environment buffers the 3 most recent raw observations and concatenates them sequentially. This expands the state dimension from 12 to 36 (12 inputs $\times$ 3 stacked frames), providing the neural network with temporal context. This allows the model to implicitly compute velocity, rates of approach to obstacles/boundaries, and acceleration.
 - **Action Space**: 9 discrete actions representing combinations of steering (Left, Straight, Right) and acceleration (Accelerate, Coast, Brake).
 - **DQN Reward Design**:
   - Base time penalty (`-0.1` per step) to encourage speed.

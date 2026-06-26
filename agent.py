@@ -27,12 +27,14 @@ class ReplayBuffer:
         return len(self.buffer)
 
 class DQNAgent:
-    def __init__(self, state_dim=8, action_dim=9, lr=3e-4, gamma=0.99, epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=20000, buffer_capacity=100000, batch_size=128, tau=0.005):
+    def __init__(self, state_dim=8, action_dim=9, lr=3e-4, gamma=0.99, epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=20000, buffer_capacity=100000, batch_size=128, tau=0.001, min_replay_size=2000):
+
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.gamma = gamma
         self.batch_size = batch_size
         self.tau = tau
+        self.min_replay_size = min_replay_size
         
         # Epsilon-greedy parameters
         self.epsilon = epsilon_start
@@ -79,7 +81,7 @@ class DQNAgent:
         """
         Performs one gradient descent update step.
         """
-        if len(self.memory) < self.batch_size:
+        if len(self.memory) < self.min_replay_size:
             return None
             
         # Sample mini-batch
@@ -95,10 +97,12 @@ class DQNAgent:
         # Current Q-values: online network calculates Q(s, a)
         current_q = self.online_net(states_t).gather(1, actions_t)
         
-        # Target Q-values: DQN uses max Q(s', a') from target network
+        # Target Q-values: Double DQN (DDQN) to prevent overestimation bias
         with torch.no_grad():
-            next_q = self.target_net(next_states_t).max(dim=1, keepdim=True)[0]
+            next_state_actions = self.online_net(next_states_t).argmax(dim=1, keepdim=True)
+            next_q = self.target_net(next_states_t).gather(1, next_state_actions)
             target_q = rewards_t + self.gamma * next_q * (1 - dones_t)
+
             
         # Compute Loss
         loss = self.loss_fn(current_q, target_q)
@@ -142,9 +146,14 @@ class DQNAgent:
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             
-        self.steps_done = checkpoint.get('steps_done', 0)
-        # Recalculate epsilon
-        self.epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
-                       np.exp(-1.0 * self.steps_done / self.epsilon_decay)
-        print(f"Model loaded from {filepath}. Epsilon set to {self.epsilon:.3f}")
+        if 'steps_done' in checkpoint:
+            self.steps_done = checkpoint['steps_done']
+            self.epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
+                           np.exp(-1.0 * self.steps_done / self.epsilon_decay)
+            print(f"Model loaded from {filepath}. Epsilon set to {self.epsilon:.3f}")
+        else:
+            self.steps_done = 0
+            self.epsilon = 0.0
+            print(f"Model loaded from {filepath} (raw weights). Epsilon set to {self.epsilon:.3f}")
+
         return checkpoint.get('metadata', None)

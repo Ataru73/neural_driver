@@ -8,9 +8,12 @@ from environment import generate_track_points, compute_boundaries
 class GeneticCarRacingEnv:
     metadata = {"render_modes": ["human"], "render_fps": 60}
     
-    def __init__(self, pop_size=30, render_mode=None):
+    def __init__(self, pop_size=30, render_mode=None, num_obstacles=0):
         self.pop_size = pop_size
         self.render_mode = render_mode
+        self.num_obstacles = num_obstacles
+        self.obstacle_radius = 14.0
+        self.obstacles = []
         
         # Window / Screen parameters
         self.width = 1200
@@ -51,7 +54,7 @@ class GeneticCarRacingEnv:
         self.car_radius = 12.0
         
         # Raycast parameters
-        self.ray_angles = np.array([-90, -45, -20, 0, 20, 45, 90])
+        self.ray_angles = np.array([-90, -70, -45, -30, -15, 0, 15, 30, 45, 70, 90])
         self.num_rays = len(self.ray_angles)
         self.max_ray_len = 250.0
         
@@ -85,26 +88,79 @@ class GeneticCarRacingEnv:
         self.clock = None
         self.generation = 1
         
-    def reset(self, generation=None):
+        # Frame stacking for population
+        self.history_len = 3
+        self.observation_space = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(self.history_len * (self.num_rays + 1),),
+            dtype=np.float32
+        )
+        
+    def reset(self, generation=None, random_start=False):
         if generation is not None:
             self.generation = generation
             
-        tangent = self.centerline[1] - self.centerline[0]
+        start_idx = 0
+        if random_start:
+            # Pick one random start checkpoint for the entire population to keep it fair
+            start_idx = np.random.randint(0, self.num_checkpoints)
+            
+        next_idx = (start_idx + 1) % self.num_checkpoints
+        tangent = self.centerline[next_idx] - self.centerline[start_idx]
         start_angle = math.atan2(tangent[1], tangent[0])
         
+        # Initialize population state arrays
+        self.checkpoints_passed = np.zeros(self.pop_size, dtype=int)
+        
         for i in range(self.pop_size):
-            self.car_pos[i] = np.array(self.centerline[0], dtype=np.float32)
+            self.car_pos[i] = np.array(self.centerline[start_idx], dtype=np.float32)
             self.car_angle[i] = start_angle
             self.car_speed[i] = 0.0
             self.active[i] = True
             
-            self.current_checkpoint[i] = 0
-            self.next_checkpoint[i] = 1
+            self.current_checkpoint[i] = start_idx
+            self.next_checkpoint[i] = next_idx
             self.steps_since_progress[i] = 0
             self.total_steps[i] = 0
             self.lap_count[i] = 0
             self.fitness[i] = 0.0
             
+        # Generate obstacles
+        self.obstacles = []
+        if self.num_obstacles > 0:
+            valid_cps = []
+            for offset in range(25, self.num_checkpoints - 25):
+                idx = (start_idx + offset) % self.num_checkpoints
+                valid_cps.append(idx)
+            
+            if len(valid_cps) >= self.num_obstacles:
+                chosen_cps = np.random.choice(valid_cps, size=self.num_obstacles, replace=False)
+            else:
+                chosen_cps = np.random.choice(valid_cps, size=self.num_obstacles, replace=True)
+                
+            for idx in chosen_cps:
+                pt = self.centerline[idx]
+                next_pt = self.centerline[(idx + 1) % self.num_checkpoints]
+                tangent = next_pt - pt
+                length = np.linalg.norm(tangent)
+                normal = np.array([-tangent[1], tangent[0]]) / (length if length > 0 else 1.0)
+                
+                max_offset = (self.track_width / 2.0) - self.obstacle_radius - 12.0
+                shift = np.random.uniform(-max_offset, max_offset)
+                self.obstacles.append(pt + shift * normal)
+                
+        # Initialize and populate history array for all cars
+        self.state_history = np.zeros((self.pop_size, self.history_len, self.num_rays + 1), dtype=np.float32)
+        for i in range(self.pop_size):
+            raw_obs = np.zeros(self.num_rays + 1, dtype=np.float32)
+            ray_distances = self._cast_car_rays(i)
+            raw_obs[:self.num_rays] = ray_distances
+            raw_obs[self.num_rays] = self.car_speed[i] / self.max_speed
+            
+            for h in range(self.history_len):
+                self.state_history[i, h] = raw_obs
+                
         return self._get_observations()
         
     def step(self, actions):
@@ -147,12 +203,28 @@ class GeneticCarRacingEnv:
             # Cast rays to compute collision and distances
             ray_distances = self._cast_car_rays(i)
             
+            # Update state history for this car
+            raw_obs = np.zeros(self.num_rays + 1, dtype=np.float32)
+            raw_obs[:self.num_rays] = ray_distances
+            raw_obs[self.num_rays] = self.car_speed[i] / self.max_speed
+            
+            self.state_history[i] = np.roll(self.state_history[i], -1, axis=0)
+            self.state_history[i, -1] = raw_obs
+            
             # Check collisions
             dist_to_centerline = np.linalg.norm(self.car_pos[i] - self.centerline[self.current_checkpoint[i]])
             off_track = dist_to_centerline > (self.track_width / 2.0 - self.car_radius + 5.0)
             near_collision = np.any(ray_distances * self.max_ray_len < self.car_radius)
             
-            collided = off_track or near_collision
+            # Check obstacle collisions
+            hit_obstacle = False
+            for obs_pos in self.obstacles:
+                dist_to_obs = np.linalg.norm(self.car_pos[i] - obs_pos)
+                if dist_to_obs < (self.car_radius + self.obstacle_radius):
+                    hit_obstacle = True
+                    break
+                    
+            collided = off_track or near_collision or hit_obstacle
             
             # Update Fitness
             # Base survival reward
@@ -165,9 +237,11 @@ class GeneticCarRacingEnv:
                 self.fitness[i] += 150.0
                 self.next_checkpoint[i] = (self.next_checkpoint[i] + 1) % self.num_checkpoints
                 self.steps_since_progress[i] = 0
+                self.checkpoints_passed[i] += 1
                 
-                if self.next_checkpoint[i] == 1:
+                if self.checkpoints_passed[i] >= self.num_checkpoints:
                     self.lap_count[i] += 1
+                    self.checkpoints_passed[i] = 0
                     # Sorter time (fewer steps) = higher fitness.
                     # Base reward is 50000.0, and we subtract 5.0 per step taken.
                     self.fitness[i] = 50000.0 - (self.total_steps[i] * 5.0)
@@ -217,34 +291,59 @@ class GeneticCarRacingEnv:
             denom = r[0] * self.S[:, 1] - r[1] * self.S[:, 0]
             mask = np.abs(denom) > 1e-6
             
-            if not np.any(mask):
-                ray_distances.append(1.0)
-                continue
+            min_t = 1.0
+            if np.any(mask):
+                q_p_x = self.Q[mask, 0] - self.car_pos[i, 0]
+                q_p_y = self.Q[mask, 1] - self.car_pos[i, 1]
                 
-            q_p_x = self.Q[mask, 0] - self.car_pos[i, 0]
-            q_p_y = self.Q[mask, 1] - self.car_pos[i, 1]
-            
-            t_val = (q_p_x * self.S[mask, 1] - q_p_y * self.S[mask, 0]) / denom[mask]
-            u_val = (q_p_x * r[1] - q_p_y * r[0]) / denom[mask]
-            
-            valid = (t_val >= 0.0) & (t_val <= 1.0) & (u_val >= 0.0) & (u_val <= 1.0)
-            
-            valid_t = t_val[valid]
-            if len(valid_t) > 0:
-                ray_distances.append(float(np.min(valid_t)))
-            else:
-                ray_distances.append(1.0)
+                t_val = (q_p_x * self.S[mask, 1] - q_p_y * self.S[mask, 0]) / denom[mask]
+                u_val = (q_p_x * r[1] - q_p_y * r[0]) / denom[mask]
+                
+                valid = (t_val >= 0.0) & (t_val <= 1.0) & (u_val >= 0.0) & (u_val <= 1.0)
+                valid_t = t_val[valid]
+                if len(valid_t) > 0:
+                    min_t = float(np.min(valid_t))
+                    
+            # Check obstacle intersections
+            for obs_pos in self.obstacles:
+                t_obs = self._intersect_ray_circle(self.car_pos[i], r, obs_pos, self.obstacle_radius)
+                if t_obs < min_t:
+                    min_t = t_obs
+                    
+            ray_distances.append(min_t)
                 
         return np.array(ray_distances, dtype=np.float32)
+
+    def _intersect_ray_circle(self, p, r, center, radius):
+        v = p - center
+        a = r[0]**2 + r[1]**2
+        b = 2.0 * (v[0]*r[0] + v[1]*r[1])
+        c = (v[0]**2 + v[1]**2) - radius**2
+        
+        disc = b**2 - 4.0 * a * c
+        if disc < 0:
+            return 1.0
+            
+        sqrt_disc = math.sqrt(disc)
+        t1 = (-b - sqrt_disc) / (2.0 * a)
+        t2 = (-b + sqrt_disc) / (2.0 * a)
+        
+        valid_ts = []
+        if 0.0 <= t1 <= 1.0:
+            valid_ts.append(t1)
+        if 0.0 <= t2 <= 1.0:
+            valid_ts.append(t2)
+            
+        if len(valid_ts) > 0:
+            return min(valid_ts)
+        return 1.0
         
     def _get_observations(self):
-        obs = np.zeros((self.pop_size, self.num_rays + 1), dtype=np.float32)
+        obs = np.zeros((self.pop_size, self.history_len * (self.num_rays + 1)), dtype=np.float32)
         for i in range(self.pop_size):
             if not self.active[i]:
                 continue
-            ray_distances = self._cast_car_rays(i)
-            obs[i, :self.num_rays] = ray_distances
-            obs[i, self.num_rays] = self.car_speed[i] / self.max_speed
+            obs[i] = self.state_history[i].flatten()
         return obs
         
     def _render_frame(self):
@@ -265,6 +364,12 @@ class GeneticCarRacingEnv:
         pygame.draw.polygon(self.screen, (34, 139, 34), self.inner_boundary)
         pygame.draw.polygon(self.screen, (220, 220, 220), self.outer_boundary, 3)
         pygame.draw.polygon(self.screen, (220, 220, 220), self.inner_boundary, 3)
+        
+        # Draw Obstacles
+        for obs_pos in self.obstacles:
+            pygame.draw.circle(self.screen, (220, 50, 50), obs_pos.astype(int), int(self.obstacle_radius))
+            pygame.draw.circle(self.screen, (240, 240, 240), obs_pos.astype(int), int(self.obstacle_radius * 0.6))
+            pygame.draw.circle(self.screen, (220, 50, 50), obs_pos.astype(int), int(self.obstacle_radius * 0.2))
         
         # Find leading active car (greatest checkpoint or highest fitness)
         leader_idx = -1

@@ -3,6 +3,7 @@ import pygame
 import gymnasium as gym
 from gymnasium import spaces
 import math
+from collections import deque
 
 def get_catmull_rom_point(p0, p1, p2, p3, t):
     """
@@ -63,8 +64,11 @@ def compute_boundaries(centerline, width=90.0):
 class CarRacingEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
     
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, num_obstacles=0):
         super().__init__()
+        self.num_obstacles = num_obstacles
+        self.obstacle_radius = 14.0
+        self.obstacles = []
         
         # Track definition
         # Window size is 1200 x 900
@@ -107,7 +111,7 @@ class CarRacingEnv(gym.Env):
         self.car_radius = 12.0 # for collision detection
         
         # Raycast parameters
-        self.ray_angles = np.array([-90, -45, -20, 0, 20, 45, 90]) # in degrees
+        self.ray_angles = np.array([-90, -70, -45, -30, -15, 0, 15, 30, 45, 70, 90]) # in degrees
         self.num_rays = len(self.ray_angles)
         self.max_ray_len = 250.0
         
@@ -129,12 +133,13 @@ class CarRacingEnv(gym.Env):
         self.action_space = spaces.Discrete(9)
         
         # Observation Space:
-        # [ray_0, ray_1, ..., ray_6, speed]
+        # [ray_0, ray_1, ..., ray_6, speed] stacked history_len times
         # All values normalized to [0, 1]
+        self.history_len = 3
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.num_rays + 1,),
+            shape=(self.history_len * (self.num_rays + 1),),
             dtype=np.float32
         )
         
@@ -154,24 +159,57 @@ class CarRacingEnv(gym.Env):
         self.total_steps = 0
         self.lap_count = 0
         
-    def reset(self, seed=None, options=None):
+    def reset(self, seed=None, options=None, random_start=False):
         super().reset(seed=seed)
         
-        # Start at checkpoint 0
-        self.car_pos = np.array(self.centerline[0], dtype=np.float32)
+        # Determine starting checkpoint
+        start_idx = 0
+        if random_start:
+            # self.np_random is defined by gymnasium
+            start_idx = self.np_random.integers(0, self.num_checkpoints)
+            
+        self.car_pos = np.array(self.centerline[start_idx], dtype=np.float32)
         
         # Align heading with the direction to the next checkpoint
-        tangent = self.centerline[1] - self.centerline[0]
+        next_idx = (start_idx + 1) % self.num_checkpoints
+        tangent = self.centerline[next_idx] - self.centerline[start_idx]
         self.car_angle = math.atan2(tangent[1], tangent[0])
         self.car_speed = 0.0
         
-        self.current_checkpoint = 0
-        self.next_checkpoint = 1
+        self.current_checkpoint = start_idx
+        self.next_checkpoint = next_idx
+        self.checkpoints_passed = 0
         self.steps_since_progress = 0
         self.total_steps = 0
         self.lap_count = 0
         
-        observation = self._get_obs()
+        # Generate obstacles
+        self.obstacles = []
+        if self.num_obstacles > 0:
+            valid_cps = []
+            for offset in range(25, self.num_checkpoints - 25):
+                idx = (start_idx + offset) % self.num_checkpoints
+                valid_cps.append(idx)
+            
+            if len(valid_cps) >= self.num_obstacles:
+                chosen_cps = self.np_random.choice(valid_cps, size=self.num_obstacles, replace=False)
+            else:
+                chosen_cps = self.np_random.choice(valid_cps, size=self.num_obstacles, replace=True)
+                
+            for idx in chosen_cps:
+                pt = self.centerline[idx]
+                next_pt = self.centerline[(idx + 1) % self.num_checkpoints]
+                tangent = next_pt - pt
+                length = np.linalg.norm(tangent)
+                normal = np.array([-tangent[1], tangent[0]]) / (length if length > 0 else 1.0)
+                
+                max_offset = (self.track_width / 2.0) - self.obstacle_radius - 12.0
+                shift = self.np_random.uniform(-max_offset, max_offset)
+                self.obstacles.append(pt + shift * normal)
+                
+        raw_obs = self._get_obs()
+        self.state_history = deque([raw_obs] * self.history_len, maxlen=self.history_len)
+        observation = np.concatenate(self.state_history, dtype=np.float32)
         info = {}
         
         if self.render_mode == "human":
@@ -223,7 +261,15 @@ class CarRacingEnv(gym.Env):
         off_track = dist_to_centerline > (self.track_width / 2.0 - self.car_radius + 5.0)
         near_collision = np.any(ray_distances * self.max_ray_len < self.car_radius)
         
-        collided = off_track or near_collision
+        # Check obstacle collisions
+        hit_obstacle = False
+        for obs_pos in self.obstacles:
+            dist_to_obs = np.linalg.norm(self.car_pos - obs_pos)
+            if dist_to_obs < (self.car_radius + self.obstacle_radius):
+                hit_obstacle = True
+                break
+                
+        collided = off_track or near_collision or hit_obstacle
         
         # Reward function design
         reward = 0.0
@@ -245,11 +291,13 @@ class CarRacingEnv(gym.Env):
                 reward += 15.0
                 self.next_checkpoint = (self.next_checkpoint + 1) % self.num_checkpoints
                 self.steps_since_progress = 0
+                self.checkpoints_passed += 1
                 checkpoint_passed = True
                 
                 # Check for lap completion
-                if self.next_checkpoint == 1:
+                if self.checkpoints_passed >= self.num_checkpoints:
                     self.lap_count += 1
+                    self.checkpoints_passed = 0
                     reward += 100.0 # big lap completion reward!
                     # End episode after 2 laps to avoid infinite loops during training
                     if self.lap_count >= 2:
@@ -279,9 +327,12 @@ class CarRacingEnv(gym.Env):
             
         # Prepare observation
         # Observation includes the raycast distances (normalized to [0,1]) and the speed (normalized to [0,1])
-        observation = np.zeros(self.num_rays + 1, dtype=np.float32)
-        observation[:self.num_rays] = ray_distances
-        observation[self.num_rays] = self.car_speed / self.max_speed
+        raw_obs = np.zeros(self.num_rays + 1, dtype=np.float32)
+        raw_obs[:self.num_rays] = ray_distances
+        raw_obs[self.num_rays] = self.car_speed / self.max_speed
+        
+        self.state_history.append(raw_obs)
+        observation = np.concatenate(self.state_history, dtype=np.float32)
         
         info = {
             "checkpoint": self.current_checkpoint,
@@ -334,27 +385,53 @@ class CarRacingEnv(gym.Env):
         return np.array(ray_distances, dtype=np.float32)
         
     def _cast_ray(self, p, r):
-        # Vectorized intersection of ray (p, r) with boundaries Q, S
-        # Q: start of segments (2N, 2)
-        # S: segment vectors (2N, 2)
+        # 1. Boundary intersection
         denom = r[0] * self.S[:, 1] - r[1] * self.S[:, 0]
-        
-        # Avoid division by zero
         mask = np.abs(denom) > 1e-6
-        if not np.any(mask):
+        
+        min_t = 1.0
+        if np.any(mask):
+            q_p_x = self.Q[mask, 0] - p[0]
+            q_p_y = self.Q[mask, 1] - p[1]
+            
+            t_val = (q_p_x * self.S[mask, 1] - q_p_y * self.S[mask, 0]) / denom[mask]
+            u_val = (q_p_x * r[1] - q_p_y * r[0]) / denom[mask]
+            
+            valid = (t_val >= 0.0) & (t_val <= 1.0) & (u_val >= 0.0) & (u_val <= 1.0)
+            valid_t = t_val[valid]
+            if len(valid_t) > 0:
+                min_t = float(np.min(valid_t))
+                
+        # 2. Obstacle intersection
+        for obs_pos in self.obstacles:
+            t_obs = self._intersect_ray_circle(p, r, obs_pos, self.obstacle_radius)
+            if t_obs < min_t:
+                min_t = t_obs
+                
+        return min_t
+
+    def _intersect_ray_circle(self, p, r, center, radius):
+        v = p - center
+        a = r[0]**2 + r[1]**2
+        b = 2.0 * (v[0]*r[0] + v[1]*r[1])
+        c = (v[0]**2 + v[1]**2) - radius**2
+        
+        disc = b**2 - 4.0 * a * c
+        if disc < 0:
             return 1.0
             
-        q_p_x = self.Q[mask, 0] - p[0]
-        q_p_y = self.Q[mask, 1] - p[1]
+        sqrt_disc = math.sqrt(disc)
+        t1 = (-b - sqrt_disc) / (2.0 * a)
+        t2 = (-b + sqrt_disc) / (2.0 * a)
         
-        t_val = (q_p_x * self.S[mask, 1] - q_p_y * self.S[mask, 0]) / denom[mask]
-        u_val = (q_p_x * r[1] - q_p_y * r[0]) / denom[mask]
-        
-        valid = (t_val >= 0.0) & (t_val <= 1.0) & (u_val >= 0.0) & (u_val <= 1.0)
-        
-        valid_t = t_val[valid]
-        if len(valid_t) > 0:
-            return float(np.min(valid_t))
+        valid_ts = []
+        if 0.0 <= t1 <= 1.0:
+            valid_ts.append(t1)
+        if 0.0 <= t2 <= 1.0:
+            valid_ts.append(t2)
+            
+        if len(valid_ts) > 0:
+            return min(valid_ts)
         return 1.0
         
     def render(self):
@@ -396,6 +473,15 @@ class CarRacingEnv(gym.Env):
             else:
                 pygame.draw.circle(self.screen, (100, 100, 100), cp.astype(int), 2)
                 
+        # Draw Obstacles
+        for obs_pos in self.obstacles:
+            # Draw outer red circle
+            pygame.draw.circle(self.screen, (220, 50, 50), obs_pos.astype(int), int(self.obstacle_radius))
+            # Draw inner white circle
+            pygame.draw.circle(self.screen, (240, 240, 240), obs_pos.astype(int), int(self.obstacle_radius * 0.6))
+            # Draw center red dot
+            pygame.draw.circle(self.screen, (220, 50, 50), obs_pos.astype(int), int(self.obstacle_radius * 0.2))
+            
         # Draw Raycasts
         ray_distances = self._cast_all_rays()
         for angle_deg, dist in zip(self.ray_angles, ray_distances):
